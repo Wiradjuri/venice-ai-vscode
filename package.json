@@ -31,6 +31,10 @@
         "title": "Venice: Toggle Inline Completions"
       },
       {
+        "command": "venice.selectProvider",
+        "title": "Venice: Select AI Provider"
+      },
+      {
         "command": "venice.clearChat",
         "title": "Venice: Clear Chat History"
       }
@@ -47,10 +51,25 @@
     "configuration": {
       "title": "Venice AI",
       "properties": {
+        "venice.provider": {
+          "type": "string",
+          "enum": ["venice", "openrouter"],
+          "enumDescriptions": [
+            "Use Venice AI (api.venice.ai)",
+            "Use OpenRouter (openrouter.ai)"
+          ],
+          "default": "venice",
+          "description": "The AI provider to use for chat and completions"
+        },
         "venice.model": {
           "type": "string",
           "default": "olafangensan-glm-4.7-flash-heretic",
-          "description": "The Venice AI model to use"
+          "description": "The model to use when the provider is Venice"
+        },
+        "venice.openrouterModel": {
+          "type": "string",
+          "default": "openai/gpt-4o-mini",
+          "description": "The model to use when the provider is OpenRouter"
         },
         "venice.completionsEnabled": {
           "type": "boolean",

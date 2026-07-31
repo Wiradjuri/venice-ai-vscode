@@ -1,22 +1,25 @@
 # Venice AI for VS Code
 
-AI-powered code completions and chat using Venice AI.
+AI-powered code completions and chat using Venice AI or OpenRouter.
 
 ## Features
 
-- **Chat Sidebar**: Have conversations with Venice AI directly in VS Code
+- **Chat Sidebar**: Have conversations with your AI provider directly in VS Code
 - **Inline Completions**: Get ghost text code suggestions as you type (like Copilot)
-- **Multiple Models**: Configure your preferred Venice model
+- **Multiple Providers**: Switch between Venice AI and OpenRouter
+- **Multiple Models**: Configure your preferred model per provider
 
 ## Setup
 
 1. Install the extension
-2. Run command: `Venice: Set API Key`
-3. Enter your Venice API key
+2. (Optional) Run command: `Venice: Select AI Provider` to choose Venice or OpenRouter
+3. Run command: `Venice: Set API Key`
+4. Enter the API key for the selected provider
 
 ## Commands
 
-- `Venice: Set API Key` - Configure your API key
+- `Venice: Set API Key` - Configure the API key for the currently selected provider
+- `Venice: Select AI Provider` - Switch between Venice AI and OpenRouter
 - `Venice: Open Chat` - Open the chat sidebar (Cmd+Shift+V)
 - `Venice: Toggle Inline Completions` - Enable/disable ghost text suggestions
 - `Venice: Clear Chat History` - Clear conversation history
@@ -25,10 +28,14 @@ AI-powered code completions and chat using Venice AI.
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `venice.model` | `olafangensan-glm-4.7-flash-heretic` | Venice model to use |
+| `venice.provider` | `venice` | AI provider to use: `venice` or `openrouter` |
+| `venice.model` | `olafangensan-glm-4.7-flash-heretic` | Model to use when provider is Venice |
+| `venice.openrouterModel` | `openai/gpt-4o-mini` | Model to use when provider is OpenRouter |
 | `venice.completionsEnabled` | `true` | Enable inline completions |
 | `venice.completionDebounceMs` | `300` | Debounce delay for completions |
 | `venice.maxContextLines` | `50` | Lines of context for completions |
+
+Each provider stores its own API key separately, so switching providers doesn't require re-entering keys you've already saved.
 
 ## Development
 

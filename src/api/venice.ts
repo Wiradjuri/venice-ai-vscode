@@ -1,6 +1,30 @@
 import * as vscode from 'vscode';
 
-const BASE_URL = 'https://api.venice.ai/api/v1';
+export type Provider = 'venice' | 'openrouter';
+
+export const PROVIDER_LABELS: Record<Provider, string> = {
+    venice: 'Venice',
+    openrouter: 'OpenRouter'
+};
+
+interface ProviderConfig {
+    baseUrl: string;
+    secretKey: string;
+    defaultModel: string;
+}
+
+const PROVIDERS: Record<Provider, ProviderConfig> = {
+    venice: {
+        baseUrl: 'https://api.venice.ai/api/v1',
+        secretKey: 'venice-api-key',
+        defaultModel: 'olafangensan-glm-4.7-flash-heretic'
+    },
+    openrouter: {
+        baseUrl: 'https://openrouter.ai/api/v1',
+        secretKey: 'openrouter-api-key',
+        defaultModel: 'openai/gpt-4o-mini'
+    }
+};
 
 export interface ChatMessage {
     role: 'system' | 'user' | 'assistant';
@@ -21,35 +45,58 @@ export class VeniceClient {
         this.context = context;
     }
 
+    getProvider(): Provider {
+        const config = vscode.workspace.getConfiguration('venice');
+        return config.get<Provider>('provider', 'venice');
+    }
+
     async getApiKey(): Promise<string | undefined> {
-        return await this.context.secrets.get('venice-api-key');
+        return await this.context.secrets.get(PROVIDERS[this.getProvider()].secretKey);
     }
 
     async setApiKey(key: string): Promise<void> {
-        await this.context.secrets.store('venice-api-key', key);
+        await this.context.secrets.store(PROVIDERS[this.getProvider()].secretKey, key);
     }
 
     async deleteApiKey(): Promise<void> {
-        await this.context.secrets.delete('venice-api-key');
+        await this.context.secrets.delete(PROVIDERS[this.getProvider()].secretKey);
+    }
+
+    private getBaseUrl(): string {
+        return PROVIDERS[this.getProvider()].baseUrl;
     }
 
     private getModel(): string {
+        const provider = this.getProvider();
         const config = vscode.workspace.getConfiguration('venice');
-        return config.get('model', 'olafangensan-glm-4.7-flash-heretic');
+        if (provider === 'openrouter') {
+            return config.get('openrouterModel', PROVIDERS.openrouter.defaultModel);
+        }
+        return config.get('model', PROVIDERS.venice.defaultModel);
+    }
+
+    private getHeaders(apiKey: string): Record<string, string> {
+        const headers: Record<string, string> = {
+            'Authorization': `Bearer ${apiKey}`,
+            'Content-Type': 'application/json'
+        };
+        if (this.getProvider() === 'openrouter') {
+            headers['HTTP-Referer'] = 'https://github.com/Wiradjuri/venice-ai-vscode';
+            headers['X-Title'] = 'Venice AI VS Code Extension';
+        }
+        return headers;
     }
 
     async chat(messages: ChatMessage[], options: CompletionOptions = {}): Promise<string> {
+        const provider = this.getProvider();
         const apiKey = await this.getApiKey();
         if (!apiKey) {
-            throw new Error('API key not set. Run "Venice: Set API Key" command.');
+            throw new Error(`${PROVIDER_LABELS[provider]} API key not set. Run "Venice: Set API Key" command.`);
         }
 
-        const response = await fetch(`${BASE_URL}/chat/completions`, {
+        const response = await fetch(`${this.getBaseUrl()}/chat/completions`, {
             method: 'POST',
-            headers: {
-                'Authorization': `Bearer ${apiKey}`,
-                'Content-Type': 'application/json'
-            },
+            headers: this.getHeaders(apiKey),
             body: JSON.stringify({
                 model: options.model || this.getModel(),
                 messages: messages,
@@ -61,7 +108,7 @@ export class VeniceClient {
 
         if (!response.ok) {
             const error = await response.text();
-            throw new Error(`Venice API error: ${response.status} - ${error}`);
+            throw new Error(`${PROVIDER_LABELS[provider]} API error: ${response.status} - ${error}`);
         }
 
         const data = await response.json() as {
@@ -71,17 +118,15 @@ export class VeniceClient {
     }
 
     async *chatStream(messages: ChatMessage[], options: CompletionOptions = {}): AsyncGenerator<string> {
+        const provider = this.getProvider();
         const apiKey = await this.getApiKey();
         if (!apiKey) {
-            throw new Error('API key not set. Run "Venice: Set API Key" command.');
+            throw new Error(`${PROVIDER_LABELS[provider]} API key not set. Run "Venice: Set API Key" command.`);
         }
 
-        const response = await fetch(`${BASE_URL}/chat/completions`, {
+        const response = await fetch(`${this.getBaseUrl()}/chat/completions`, {
             method: 'POST',
-            headers: {
-                'Authorization': `Bearer ${apiKey}`,
-                'Content-Type': 'application/json'
-            },
+            headers: this.getHeaders(apiKey),
             body: JSON.stringify({
                 model: options.model || this.getModel(),
                 messages: messages,
@@ -93,7 +138,7 @@ export class VeniceClient {
 
         if (!response.ok) {
             const error = await response.text();
-            throw new Error(`Venice API error: ${response.status} - ${error}`);
+            throw new Error(`${PROVIDER_LABELS[provider]} API error: ${response.status} - ${error}`);
         }
 
         const reader = response.body?.getReader();

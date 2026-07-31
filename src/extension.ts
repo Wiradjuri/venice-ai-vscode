@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { VeniceClient } from './api/venice';
+import { VeniceClient, PROVIDER_LABELS, Provider } from './api/venice';
 import { ChatViewProvider } from './chat/chatProvider';
 import { InlineCompletionProvider } from './completion/inlineProvider';
 
@@ -28,8 +28,9 @@ export function activate(context: vscode.ExtensionContext) {
 
     context.subscriptions.push(
         vscode.commands.registerCommand('venice.setApiKey', async () => {
+            const providerLabel = PROVIDER_LABELS[client.getProvider()];
             const key = await vscode.window.showInputBox({
-                prompt: 'Enter your Venice API key',
+                prompt: `Enter your ${providerLabel} API key`,
                 password: true,
                 ignoreFocusOut: true,
                 placeHolder: 'sk-...'
@@ -37,7 +38,29 @@ export function activate(context: vscode.ExtensionContext) {
 
             if (key) {
                 await client.setApiKey(key);
-                vscode.window.showInformationMessage('Venice API key saved securely');
+                vscode.window.showInformationMessage(`${providerLabel} API key saved securely`);
+            }
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('venice.selectProvider', async () => {
+            const providers: Provider[] = ['venice', 'openrouter'];
+            const current = client.getProvider();
+            const pick = await vscode.window.showQuickPick(
+                providers.map(p => ({
+                    label: PROVIDER_LABELS[p],
+                    description: p === current ? 'current' : undefined,
+                    provider: p
+                })),
+                { placeHolder: 'Select the AI provider to use' }
+            );
+
+            if (pick) {
+                const config = vscode.workspace.getConfiguration('venice');
+                await config.update('provider', pick.provider, vscode.ConfigurationTarget.Global);
+                vscode.window.showInformationMessage(`Venice AI provider set to ${pick.label}`);
+                checkApiKey(client);
             }
         })
     );
@@ -72,8 +95,9 @@ export function activate(context: vscode.ExtensionContext) {
 async function checkApiKey(client: VeniceClient) {
     const key = await client.getApiKey();
     if (!key) {
+        const providerLabel = PROVIDER_LABELS[client.getProvider()];
         const action = await vscode.window.showWarningMessage(
-            'Venice AI: No API key configured',
+            `Venice AI: No ${providerLabel} API key configured`,
             'Set API Key'
         );
         if (action === 'Set API Key') {
