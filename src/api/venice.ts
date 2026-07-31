@@ -3,8 +3,25 @@ import * as vscode from 'vscode';
 const BASE_URL = 'https://api.venice.ai/api/v1';
 
 export interface ChatMessage {
-    role: 'system' | 'user' | 'assistant';
-    content: string;
+    role: 'system' | 'user' | 'assistant' | 'tool';
+    content?: string;
+    tool_calls?: Array<{
+        id: string;
+        function: {
+            name: string;
+            arguments: string;
+        };
+    }>;
+    tool_call_id?: string;
+}
+
+export interface ToolDefinition {
+    type: 'function';
+    function: {
+        name: string;
+        description: string;
+        parameters: Record<string, unknown>;
+    };
 }
 
 export interface CompletionOptions {
@@ -12,6 +29,15 @@ export interface CompletionOptions {
     maxTokens?: number;
     temperature?: number;
     stream?: boolean;
+    tools?: ToolDefinition[];
+    tool_choice?: 'auto' | 'none' | { type: 'function'; function: { name: string } };
+}
+
+export interface ChatResponse {
+    choices: Array<{
+        message: ChatMessage;
+        finish_reason: 'stop' | 'tool_calls' | 'length';
+    }>;
 }
 
 export class VeniceClient {
@@ -38,10 +64,25 @@ export class VeniceClient {
         return config.get('model', 'olafangensan-glm-4.7-flash-heretic');
     }
 
-    async chat(messages: ChatMessage[], options: CompletionOptions = {}): Promise<string> {
+    async chat(messages: ChatMessage[], options: CompletionOptions = {}): Promise<string | ChatMessage> {
         const apiKey = await this.getApiKey();
         if (!apiKey) {
             throw new Error('API key not set. Run "Venice: Set API Key" command.');
+        }
+
+        const body: Record<string, unknown> = {
+            model: options.model || this.getModel(),
+            messages: messages,
+            max_tokens: options.maxTokens || 2048,
+            temperature: options.temperature ?? 0.7,
+            stream: false
+        };
+
+        if (options.tools && options.tools.length > 0) {
+            body.tools = options.tools;
+            if (options.tool_choice) {
+                body.tool_choice = options.tool_choice;
+            }
         }
 
         const response = await fetch(`${BASE_URL}/chat/completions`, {
@@ -50,13 +91,7 @@ export class VeniceClient {
                 'Authorization': `Bearer ${apiKey}`,
                 'Content-Type': 'application/json'
             },
-            body: JSON.stringify({
-                model: options.model || this.getModel(),
-                messages: messages,
-                max_tokens: options.maxTokens || 2048,
-                temperature: options.temperature ?? 0.7,
-                stream: false
-            })
+            body: JSON.stringify(body)
         });
 
         if (!response.ok) {
@@ -64,16 +99,36 @@ export class VeniceClient {
             throw new Error(`Venice API error: ${response.status} - ${error}`);
         }
 
-        const data = await response.json() as {
-            choices: Array<{ message: { content: string } }>;
-        };
-        return data.choices[0]?.message?.content || '';
+        const data = await response.json() as ChatResponse;
+        const choice = data.choices[0];
+
+        // If tool calls are present, return the full message so caller can handle them
+        if (choice?.message?.tool_calls) {
+            return choice.message;
+        }
+
+        return choice?.message?.content || '';
     }
 
-    async *chatStream(messages: ChatMessage[], options: CompletionOptions = {}): AsyncGenerator<string> {
+    async *chatStream(messages: ChatMessage[], options: CompletionOptions = {}): AsyncGenerator<string | ChatMessage> {
         const apiKey = await this.getApiKey();
         if (!apiKey) {
             throw new Error('API key not set. Run "Venice: Set API Key" command.');
+        }
+
+        const body: Record<string, unknown> = {
+            model: options.model || this.getModel(),
+            messages: messages,
+            max_tokens: options.maxTokens || 2048,
+            temperature: options.temperature ?? 0.7,
+            stream: true
+        };
+
+        if (options.tools && options.tools.length > 0) {
+            body.tools = options.tools;
+            if (options.tool_choice) {
+                body.tool_choice = options.tool_choice;
+            }
         }
 
         const response = await fetch(`${BASE_URL}/chat/completions`, {
@@ -82,13 +137,7 @@ export class VeniceClient {
                 'Authorization': `Bearer ${apiKey}`,
                 'Content-Type': 'application/json'
             },
-            body: JSON.stringify({
-                model: options.model || this.getModel(),
-                messages: messages,
-                max_tokens: options.maxTokens || 2048,
-                temperature: options.temperature ?? 0.7,
-                stream: true
-            })
+            body: JSON.stringify(body)
         });
 
         if (!response.ok) {
@@ -103,6 +152,7 @@ export class VeniceClient {
 
         const decoder = new TextDecoder();
         let buffer = '';
+        let currentMessage: ChatMessage = { role: 'assistant' };
 
         while (true) {
             const { done, value } = await reader.read();
@@ -117,15 +167,35 @@ export class VeniceClient {
                 if (!trimmed || !trimmed.startsWith('data: ')) continue;
 
                 const data = trimmed.slice(6);
-                if (data === '[DONE]') return;
+                if (data === '[DONE]') {
+                    if (currentMessage.tool_calls) {
+                        yield currentMessage;
+                    }
+                    return;
+                }
 
                 try {
                     const json = JSON.parse(data) as {
-                        choices: Array<{ delta: { content?: string } }>;
+                        choices: Array<{
+                            delta: {
+                                content?: string;
+                                tool_calls?: ChatMessage['tool_calls'];
+                            };
+                        }>;
                     };
-                    const content = json.choices[0]?.delta?.content;
-                    if (content) {
-                        yield content;
+
+                    const delta = json.choices[0]?.delta;
+                    if (delta?.content) {
+                        if (!currentMessage.content) {
+                            currentMessage.content = delta.content;
+                        } else {
+                            currentMessage.content += delta.content;
+                        }
+                        yield delta.content;
+                    }
+
+                    if (delta?.tool_calls) {
+                        currentMessage.tool_calls = delta.tool_calls;
                     }
                 } catch {
                     // Skip malformed JSON
@@ -146,10 +216,12 @@ export class VeniceClient {
             }
         ];
 
-        return this.chat(messages, {
+        const result = await this.chat(messages, {
             ...options,
             maxTokens: options.maxTokens || 256,
             temperature: options.temperature ?? 0.2
         });
+
+        return typeof result === 'string' ? result : '';
     }
 }

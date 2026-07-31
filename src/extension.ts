@@ -2,13 +2,43 @@ import * as vscode from 'vscode';
 import { VeniceClient } from './api/venice';
 import { ChatViewProvider } from './chat/chatProvider';
 import { InlineCompletionProvider } from './completion/inlineProvider';
+import { WorkspaceIndexer, RelevanceRanker } from './context';
+import { ToolRegistry, PermissionManager, FilesystemTools, TerminalTools, GitTools } from './tools';
 
 let completionsEnabled = true;
+let indexer: WorkspaceIndexer;
+let toolRegistry: ToolRegistry;
+let ranker: RelevanceRanker;
 
 export function activate(context: vscode.ExtensionContext) {
     console.log('Venice AI extension activated');
 
     const client = new VeniceClient(context);
+
+    // Initialize indexer
+    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+    indexer = new WorkspaceIndexer(context);
+    const watcherDisposable = indexer.registerFileWatcher();
+    context.subscriptions.push(indexer);
+    context.subscriptions.push(watcherDisposable);
+
+    // Initialize permission manager and tools
+    const permissionManager = new PermissionManager(workspaceRoot);
+    toolRegistry = new ToolRegistry(permissionManager);
+
+    // Register all tools
+    toolRegistry.register(FilesystemTools.READ_FILE);
+    toolRegistry.register(FilesystemTools.LIST_DIRECTORY);
+    toolRegistry.register(FilesystemTools.WRITE_FILE);
+    toolRegistry.register(FilesystemTools.APPLY_PATCH);
+    toolRegistry.register(TerminalTools.RUN_COMMAND);
+    toolRegistry.register(GitTools.STATUS);
+    toolRegistry.register(GitTools.DIFF);
+    toolRegistry.register(GitTools.COMMIT);
+    toolRegistry.register(GitTools.BRANCH);
+
+    // Initialize relevance ranker
+    ranker = new RelevanceRanker(workspaceRoot);
 
     const chatProvider = new ChatViewProvider(context.extensionUri, context);
     context.subscriptions.push(
@@ -66,6 +96,14 @@ export function activate(context: vscode.ExtensionContext) {
         })
     );
 
+    // Phase 1 indexer command
+    context.subscriptions.push(
+        vscode.commands.registerCommand('venice.rebuildIndex', async () => {
+            await indexer.buildInitialIndex();
+            vscode.window.showInformationMessage('Venice index rebuilt');
+        })
+    );
+
     checkApiKey(client);
 }
 
@@ -80,6 +118,19 @@ async function checkApiKey(client: VeniceClient) {
             vscode.commands.executeCommand('venice.setApiKey');
         }
     }
+}
+
+// Export for use by other modules (e.g., Phase 2 AgentSession)
+export function getIndexer(): WorkspaceIndexer {
+    return indexer;
+}
+
+export function getToolRegistry(): ToolRegistry {
+    return toolRegistry;
+}
+
+export function getRelevanceRanker(): RelevanceRanker {
+    return ranker;
 }
 
 export function deactivate() {
