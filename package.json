@@ -1,0 +1,91 @@
+{
+  "name": "venice-ai",
+  "displayName": "Venice AI",
+  "description": "AI-powered code completions and chat using Venice AI",
+  "version": "0.1.0",
+  "publisher": "venice-ai",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Machine Learning",
+    "Programming Languages",
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "venice.setApiKey",
+        "title": "Venice: Set API Key"
+      },
+      {
+        "command": "venice.openChat",
+        "title": "Venice: Open Chat"
+      },
+      {
+        "command": "venice.toggleCompletions",
+        "title": "Venice: Toggle Inline Completions"
+      },
+      {
+        "command": "venice.clearChat",
+        "title": "Venice: Clear Chat History"
+      }
+    ],
+    "views": {
+      "explorer": [
+        {
+          "type": "webview",
+          "id": "venice.chatView",
+          "name": "Venice AI Chat"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Venice AI",
+      "properties": {
+        "venice.model": {
+          "type": "string",
+          "default": "olafangensan-glm-4.7-flash-heretic",
+          "description": "The Venice AI model to use"
+        },
+        "venice.completionsEnabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable inline code completions"
+        },
+        "venice.completionDebounceMs": {
+          "type": "number",
+          "default": 300,
+          "description": "Debounce delay for completions in milliseconds"
+        },
+        "venice.maxContextLines": {
+          "type": "number",
+          "default": 50,
+          "description": "Maximum lines of context to send for completions"
+        }
+      }
+    },
+    "keybindings": [
+      {
+        "command": "venice.openChat",
+        "key": "ctrl+shift+v",
+        "mac": "cmd+shift+v"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.0"
+  }
+}
