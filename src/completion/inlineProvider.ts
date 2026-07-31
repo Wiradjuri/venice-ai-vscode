@@ -1,15 +1,17 @@
 import * as vscode from 'vscode';
 import { VeniceClient } from '../api/venice';
 import { getCodeContext } from '../utils/context';
+import { IgnoreService } from '../security/ignoreService';
+import { isVeniceEnabled } from '../security/workspaceGuard';
 
 export class InlineCompletionProvider implements vscode.InlineCompletionItemProvider {
-    private client: VeniceClient;
     private debounceTimer: NodeJS.Timeout | null = null;
     private lastRequestId = 0;
 
-    constructor(context: vscode.ExtensionContext) {
-        this.client = new VeniceClient(context);
-    }
+    constructor(
+        private readonly client: VeniceClient,
+        private readonly ignoreService: IgnoreService
+    ) {}
 
     async provideInlineCompletionItems(
         document: vscode.TextDocument,
@@ -20,6 +22,16 @@ export class InlineCompletionProvider implements vscode.InlineCompletionItemProv
         const config = vscode.workspace.getConfiguration('venice');
 
         if (!config.get('completionsEnabled', true)) {
+            return [];
+        }
+
+        if (!isVeniceEnabled()) {
+            return [];
+        }
+
+        // Never send content from a file excluded via .gitignore/.veniceignore, even if it's
+        // the file currently open and being edited.
+        if (this.ignoreService.isDocumentIgnored(document)) {
             return [];
         }
 
