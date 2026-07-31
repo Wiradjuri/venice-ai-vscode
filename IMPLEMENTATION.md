@@ -64,9 +64,16 @@ Phase 1 (Foundational Context Indexing) and Phase 3 (Tooling & Permissions) have
 
 **1. PermissionManager** (`src/tools/permissionManager.ts`)
 - **Denylist gate**: blocks `rm -rf`, `dd`, `mkfs`, `sudo`, `shutdown`, `reboot`, `chmod -R`, shell composition (`;&|$()`)
-- **Path confinement**: rejects file paths outside workspace
-- **Approval UI**: `vscode.window.showWarningMessage()` for exec/destructive tiers
-- **Session persistence**: "Always Allow" button skips future prompts for same tool in session
+- **Path confinement**: rejects `path`/`filePath`/`uri`/`cwd` arguments that resolve outside the
+  workspace root, for *every* tool call regardless of risk tier (a readOnly tool can leak files
+  just as easily as a write); relative paths are anchored on the workspace root, not the extension
+  host's process cwd
+- **Approval UI**: `vscode.window.showWarningMessage()` for workspaceWrite/exec/destructive tiers,
+  showing the actual command or path being requested (not just the tool name)
+- **Scoped "Always Allow"**: pins the exact command string for `exec`-tier tools (not the tool
+  name — approving `npm test` once doesn't silently approve `npm publish` later) and the tool name
+  for `workspaceWrite`-tier tools; never offered at all for `destructive` tier, which always
+  requires a fresh per-call decision
 - Risk tiers: `readOnly`, `workspaceWrite`, `exec`, `destructive`
 
 **2. ToolRegistry** (`src/tools/toolRegistry.ts`)
@@ -78,13 +85,24 @@ Phase 1 (Foundational Context Indexing) and Phase 3 (Tooling & Permissions) have
 **3. Filesystem Tools** (`src/tools/filesystem.ts`)
 - `read_file`: vscode.workspace.fs + fs.readFile
 - `list_directory`: vscode.workspace.fs.readDirectory
+- `search_workspace`: ripgrep (`rg --json`) via `child_process.execFile` with an argv array
+  (never a shell string); supports literal/regex, case sensitivity, and a capped result count;
+  returns a clear error if `rg` isn't on PATH
 - `write_file`: vscode.workspace.applyEdit (WorkspaceEdit)
 - `apply_patch`: unified diff parsing and application
 
 **4. Terminal Tools** (`src/tools/terminal.ts`)
-- `run_terminal_command`: parse with `shell-quote` into argv (never re-shell)
-- Shows command in terminal before execution
-- Denylist validation
+- `run_terminal_command`: parses the command with `shell-quote` into argv purely for
+  inspection/dispatch — never re-serialized into a shell string
+- Dispatches via the VS Code Terminal Shell Integration API
+  (`terminal.shellIntegration.executeCommand(executable, args)`), which quotes argv for the
+  user's actual shell, and captures real stdout (via `execution.read()`, ANSI-stripped) and the
+  exit code (via `onDidEndTerminalShellExecution`) — the agent loop gets a real result instead of
+  "command sent, go look at the terminal"
+- Falls back to `terminal.sendText()` (visible, uncaptured) if shell integration hasn't activated
+  within 5s, e.g. shells that don't support it
+- Bounded: 5s wait for shell integration, 120s command timeout, 20K char output cap
+- Denylist + path confinement (on `cwd`) validation via PermissionManager
 - Risk tier: `exec`
 
 **5. Git Tools** (`src/tools/git.ts`)
@@ -94,11 +112,21 @@ Phase 1 (Foundational Context Indexing) and Phase 3 (Tooling & Permissions) have
 - `git_branch`: list/create/checkout/delete branches
 - Uses VS Code Git extension API (not git CLI)
 
+**6. Debug Tools** (`src/tools/debug.ts`)
+- `debug_start`: starts a session via `vscode.debug.startDebugging`, either by a named
+  `launch.json` configuration or an inline configuration object
+- `set_breakpoint`: adds a `vscode.SourceBreakpoint` at a file/line, with an optional condition
+- Risk tier: `exec` for both (starting a debuggee runs arbitrary program code)
+
 ### Integration
 
-- **extension.ts**: Initializes `PermissionManager` + `ToolRegistry`, registers all tools, exports via `getToolRegistry()` for Phase 2
+- **extension.ts**: Initializes `PermissionManager` + `ToolRegistry`, registers all tools
+  (including `search_workspace`, `debug_start`, `set_breakpoint`), exports via
+  `getToolRegistry()` for Phase 2
 - **VeniceClient** extended to accept `tools` array and parse `tool_calls` in responses
 - **ChatMessage** and **CompletionOptions** updated to support tool-calling
+- **package.json**: `engines.vscode` / `@types/vscode` bumped to `^1.93.0`, the release that
+  finalized the Terminal Shell Integration API `run_terminal_command` depends on
 
 ### New API Surfaces
 
@@ -126,10 +154,19 @@ vscode F5                        # Launch Extension Host
 ### Phase 3 Testing
 ```bash
 # Manually test each tool:
-# 1. File tools: read_file on a file in workspace
-# 2. Terminal: run_terminal_command("echo hello")
-# 3. Git: git_status on a repo
-# Verify PermissionManager approval UI appears for exec/destructive tiers
+# 1. File tools: read_file / list_directory on a file in the workspace
+# 2. search_workspace: query for a known string, confirm rg results and an ENOENT-style
+#    error when rg is temporarily removed from PATH
+# 3. Terminal: run_terminal_command("echo hello") — confirm the approval dialog shows the
+#    literal command, and the result includes captured stdout + exitCode: 0
+# 4. Terminal denylist: run_terminal_command("rm -rf /") — confirm it's denied with no prompt
+# 5. Path confinement: read_file with path "../../etc/passwd" — confirm denial with no prompt
+# 6. Always Allow scoping: approve one run_terminal_command with "Always Allow", then issue a
+#    different command — confirm the second one still prompts
+# 7. Destructive tier: confirm no "Always Allow" button is ever offered (no destructive-tier
+#    tool ships yet, but PermissionManager.request() omits the button for that tier)
+# 8. Git: git_status on a repo
+# 9. Debug: debug_start with a configurationName from launch.json, set_breakpoint on an open file
 ```
 
 ---
@@ -152,14 +189,16 @@ src/tools/
   ├── filesystem.ts
   ├── terminal.ts
   ├── git.ts
+  ├── debug.ts
   └── index.ts
 ```
 
 ### Modified Files
 ```
-src/extension.ts                 # Initialize indexer, tools, ranker
+src/extension.ts                 # Initialize indexer, tools, ranker; register search_workspace/debug tools
 src/api/venice.ts               # Add tool-calling support
-package.json                    # Dependencies: better-sqlite3, transformers, ignore, shell-quote
+package.json                    # Dependencies: better-sqlite3, transformers, ignore, shell-quote;
+                                 # engines.vscode / @types/vscode bumped to ^1.93.0
 ```
 
 ---

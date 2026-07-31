@@ -3,7 +3,7 @@ import { VeniceClient } from './api/venice';
 import { ChatViewProvider } from './chat/chatProvider';
 import { InlineCompletionProvider } from './completion/inlineProvider';
 import { WorkspaceIndexer, RelevanceRanker } from './context';
-import { ToolRegistry, PermissionManager, FilesystemTools, TerminalTools, GitTools } from './tools';
+import { ToolRegistry, PermissionManager, FilesystemTools, TerminalTools, GitTools, DebugTools } from './tools';
 
 let completionsEnabled = true;
 let indexer: WorkspaceIndexer;
@@ -29,6 +29,7 @@ export function activate(context: vscode.ExtensionContext) {
     // Register all tools
     toolRegistry.register(FilesystemTools.READ_FILE);
     toolRegistry.register(FilesystemTools.LIST_DIRECTORY);
+    toolRegistry.register(FilesystemTools.SEARCH_WORKSPACE);
     toolRegistry.register(FilesystemTools.WRITE_FILE);
     toolRegistry.register(FilesystemTools.APPLY_PATCH);
     toolRegistry.register(TerminalTools.RUN_COMMAND);
@@ -36,6 +37,8 @@ export function activate(context: vscode.ExtensionContext) {
     toolRegistry.register(GitTools.DIFF);
     toolRegistry.register(GitTools.COMMIT);
     toolRegistry.register(GitTools.BRANCH);
+    toolRegistry.register(DebugTools.START);
+    toolRegistry.register(DebugTools.SET_BREAKPOINT);
 
     // Initialize relevance ranker
     ranker = new RelevanceRanker(workspaceRoot);
