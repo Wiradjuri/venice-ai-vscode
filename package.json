@@ -51,12 +51,21 @@
         "title": "Venice: Toggle Enabled for This Workspace"
       }
     ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "venice",
+          "title": "Venice AI",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
     "views": {
-      "explorer": [
+      "venice": [
         {
           "type": "webview",
           "id": "venice.chatView",
-          "name": "Venice AI Chat"
+          "name": "Chat"
         }
       ]
     },
