@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { VeniceClient } from './api/venice';
 import { ChatViewProvider } from './chat/chatProvider';
+import { FullChatPanel } from './chat/fullChatPanel';
 import { InlineCompletionProvider } from './completion/inlineProvider';
 import { WorkspaceIndexer, RelevanceRanker } from './context';
 import { ToolRegistry, PermissionManager, FilesystemTools, TerminalTools, GitTools, DebugTools } from './tools';
@@ -122,6 +123,93 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.commands.registerCommand('venice.clearChat', () => {
             chatProvider.clearHistory();
             vscode.window.showInformationMessage('Venice chat history cleared');
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('venice.explainSelection', async () => {
+            const editor = vscode.window.activeTextEditor;
+            if (!editor || editor.selection.isEmpty) {
+                vscode.window.showWarningMessage('Venice AI: Select some code first.');
+                return;
+            }
+            // The selected text itself isn't sent here — AgentSession.buildEditorContext()
+            // reads the live editor selection on every turn, so the instruction alone is enough.
+            await chatProvider.sendMessage('Explain what the currently selected code does, including any non-obvious behavior.');
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('venice.fixSelection', async () => {
+            const editor = vscode.window.activeTextEditor;
+            if (!editor || editor.selection.isEmpty) {
+                vscode.window.showWarningMessage('Venice AI: Select some code first.');
+                return;
+            }
+            await chatProvider.sendMessage('Review the currently selected code, point out any bugs or issues, and suggest a fixed/improved version.');
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('venice.scaffoldProject', async () => {
+            const description = await vscode.window.showInputBox({
+                prompt: 'Describe the project to scaffold',
+                placeHolder: 'e.g. A Node.js Express server with TypeScript and Jest',
+                ignoreFocusOut: true
+            });
+            if (!description) return;
+
+            // Routed through the chat sidebar (not a silent background call) so file writes stay
+            // visible turn-by-turn and still go through PermissionManager's per-write approval.
+            await chatProvider.sendMessage(
+                `Scaffold a new project in the current workspace root based on this description: "${description}". ` +
+                'Create all necessary files, folders, and configuration (e.g. package.json, tsconfig, entry point, ' +
+                'test setup) using the available file tools. Ask before overwriting anything that already exists.'
+            );
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('venice.ask', async () => {
+            const question = await vscode.window.showInputBox({
+                prompt: 'Ask Venice AI',
+                placeHolder: 'e.g. How do I reverse a linked list in TypeScript?',
+                ignoreFocusOut: true
+            });
+            if (!question) return;
+
+            await vscode.window.withProgress(
+                { location: vscode.ProgressLocation.Notification, title: 'Venice AI is thinking...' },
+                async () => {
+                    try {
+                        const result = await client.chat([
+                            { role: 'system', content: 'You are a concise coding assistant. Answer directly; use markdown code blocks for code.' },
+                            { role: 'user', content: question }
+                        ]);
+                        const reply = typeof result === 'string' ? result : (result.content ?? '');
+
+                        const activeEditor = vscode.window.activeTextEditor;
+                        if (activeEditor) {
+                            await activeEditor.edit((editBuilder) => {
+                                editBuilder.insert(activeEditor.selection.active, reply);
+                            });
+                        } else {
+                            const doc = await vscode.workspace.openTextDocument({ content: reply, language: 'markdown' });
+                            await vscode.window.showTextDocument(doc);
+                        }
+                    } catch (error) {
+                        vscode.window.showErrorMessage(
+                            `Venice AI: ${error instanceof Error ? error.message : 'Unknown error'}`
+                        );
+                    }
+                }
+            );
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('venice.openFullScreenChat', () => {
+            FullChatPanel.createOrShow(context.extensionUri, agentSession);
         })
     );
 

@@ -49,8 +49,56 @@
       {
         "command": "venice.toggleWorkspaceEnabled",
         "title": "Venice: Toggle Enabled for This Workspace"
+      },
+      {
+        "command": "venice.ask",
+        "title": "Venice AI: Ask"
+      },
+      {
+        "command": "venice.explainSelection",
+        "title": "Venice AI: Explain Selection"
+      },
+      {
+        "command": "venice.fixSelection",
+        "title": "Venice AI: Fix/Edit Selection"
+      },
+      {
+        "command": "venice.scaffoldProject",
+        "title": "Venice AI: Scaffold Project",
+        "icon": "$(new-folder)"
+      },
+      {
+        "command": "venice.openFullScreenChat",
+        "title": "Venice AI: Open Full Screen Chat",
+        "icon": "$(screen-full)"
       }
     ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "venice.explainSelection",
+          "when": "editorHasSelection",
+          "group": "venice@1"
+        },
+        {
+          "command": "venice.fixSelection",
+          "when": "editorHasSelection",
+          "group": "venice@2"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "venice.scaffoldProject",
+          "when": "view == venice.chatView",
+          "group": "navigation@1"
+        },
+        {
+          "command": "venice.openFullScreenChat",
+          "when": "view == venice.chatView",
+          "group": "navigation@2"
+        }
+      ]
+    },
     "viewsContainers": {
       "activitybar": [
         {
