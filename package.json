@@ -65,7 +65,8 @@
         {
           "type": "webview",
           "id": "venice.chatView",
-          "name": "Chat"
+          "name": "Chat",
+          "icon": "media/icon.svg"
         }
       ]
     },
