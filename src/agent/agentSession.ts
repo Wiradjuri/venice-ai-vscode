@@ -3,17 +3,22 @@ import { VeniceClient, ChatMessage, ToolDefinition } from '../api/venice';
 import { ToolRegistry } from '../tools';
 import { WorkspaceIndexer, RelevanceRanker } from '../context';
 import { IgnoreService } from '../security/ignoreService';
+import { getCurrentSelection } from '../utils/context';
 
 const MAX_TOOL_ITERATIONS = 8;
 const TOOL_RESULT_CHAR_CAP = 4000;
 const CONTEXT_CHAR_BUDGET = 6000;
 const CONTEXT_TOP_K = 8;
+const EDITOR_CONTEXT_CHAR_BUDGET = 4000;
 
 const AGENT_SYSTEM_PROMPT =
   'You are Venice AI, a coding assistant embedded in VS Code with access to tools for reading ' +
   'and writing files, searching the workspace, running terminal commands, and interacting with ' +
-  'git and the debugger. Use tools when you need information you do not already have or need ' +
-  'to make changes; do not guess about file contents. Prefer the smallest set of tool calls ' +
+  'git and the debugger. Every turn you are also told which editor tabs the user has open and ' +
+  'given the active file\'s current content (or selection, if any) directly — treat that as ' +
+  'ground truth about what the user is looking at right now, and prefer it over calling ' +
+  'read_file on the same path. Use tools when you need information you do not already have or ' +
+  'need to make changes; do not guess about file contents. Prefer the smallest set of tool calls ' +
   'that answers the request, and explain what you did once finished.';
 
 export type AgentEvent =
@@ -59,10 +64,14 @@ export class AgentSession {
 
     // Context is assembled fresh from the latest user message every turn and inserted just for
     // this call, rather than persisted into history, so it doesn't stack up turn over turn.
+    const editorContextMessage = this.buildEditorContext();
     const contextMessage = await this.assembleContext(userMessage);
     const working: ChatMessage[] = [...history, ...newMessages];
-    if (contextMessage) {
-      working.splice(working.length - 1, 0, contextMessage);
+    const toInsert = [editorContextMessage, contextMessage].filter(
+      (m): m is ChatMessage => m !== null
+    );
+    if (toInsert.length > 0) {
+      working.splice(working.length - 1, 0, ...toInsert);
     }
 
     const tools: ToolDefinition[] = this.toolRegistry.getSchemas();
@@ -106,6 +115,64 @@ export class AgentSession {
     return text.length > TOOL_RESULT_CHAR_CAP
       ? `${text.slice(0, TOOL_RESULT_CHAR_CAP)}... (truncated)`
       : text;
+  }
+
+  /**
+   * Surfaces what the user actually has open right now — tab list, active file, and either its
+   * selection or full content — as ground truth the model gets for free every turn, instead of
+   * relying solely on semantic search (which is blind to unsaved edits and can miss the very
+   * file the user is looking at).
+   */
+  private buildEditorContext(): ChatMessage | null {
+    const openTabs = [
+      ...new Set(
+        vscode.window.tabGroups.all
+          .flatMap(group => group.tabs)
+          .map(tab => tab.input)
+          .filter((input): input is vscode.TabInputText => input instanceof vscode.TabInputText)
+          .map(input => vscode.workspace.asRelativePath(input.uri))
+      )
+    ];
+
+    const editor = vscode.window.activeTextEditor;
+    const sections: string[] = [];
+
+    if (openTabs.length > 0) {
+      sections.push(`Open editor tabs: ${openTabs.join(', ')}`);
+    }
+
+    if (editor) {
+      const activePath = vscode.workspace.asRelativePath(editor.document.uri);
+      const dirtySuffix = editor.document.isDirty ? ' (has unsaved changes)' : '';
+      sections.push(`Active file: ${activePath}${dirtySuffix}`);
+
+      const selection = getCurrentSelection(editor);
+      if (selection) {
+        const truncated = selection.length > EDITOR_CONTEXT_CHAR_BUDGET
+          ? `${selection.slice(0, EDITOR_CONTEXT_CHAR_BUDGET)}\n... (truncated)`
+          : selection;
+        sections.push(
+          `Current selection in ${activePath}:\n\`\`\`${editor.document.languageId}\n${truncated}\n\`\`\``
+        );
+      } else {
+        const fullText = editor.document.getText();
+        const truncated = fullText.length > EDITOR_CONTEXT_CHAR_BUDGET
+          ? `${fullText.slice(0, EDITOR_CONTEXT_CHAR_BUDGET)}\n... (truncated)`
+          : fullText;
+        sections.push(
+          `Active file content (${activePath}):\n\`\`\`${editor.document.languageId}\n${truncated}\n\`\`\``
+        );
+      }
+    }
+
+    if (sections.length === 0) {
+      return null;
+    }
+
+    return {
+      role: 'system',
+      content: `Editor state, reflecting exactly what the user has open right now:\n\n${sections.join('\n\n')}`
+    };
   }
 
   private async assembleContext(userMessage: string): Promise<ChatMessage | null> {

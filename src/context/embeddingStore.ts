@@ -14,6 +14,7 @@ export class EmbeddingStore {
   private modelLoaded = false;
 
   constructor(storagePath: string) {
+    fs.mkdirSync(storagePath, { recursive: true });
     this.dbPath = path.join(storagePath, 'venice-index.db');
     this.db = new Database(this.dbPath);
     this.initSchema();
