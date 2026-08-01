@@ -4,6 +4,7 @@ import { ChatViewProvider } from './chat/chatProvider';
 import { InlineCompletionProvider } from './completion/inlineProvider';
 import { WorkspaceIndexer, RelevanceRanker } from './context';
 import { ToolRegistry, PermissionManager, FilesystemTools, TerminalTools, GitTools, DebugTools } from './tools';
+import { AgentSession } from './agent';
 import { IgnoreService } from './security/ignoreService';
 import { toggleVeniceEnabled, isVeniceEnabled } from './security/workspaceGuard';
 
@@ -11,6 +12,7 @@ let indexer: WorkspaceIndexer;
 let toolRegistry: ToolRegistry;
 let ranker: RelevanceRanker;
 let ignoreService: IgnoreService;
+let agentSession: AgentSession;
 
 export function activate(context: vscode.ExtensionContext) {
     console.log('Venice AI extension activated');
@@ -49,7 +51,10 @@ export function activate(context: vscode.ExtensionContext) {
     // Initialize relevance ranker
     ranker = new RelevanceRanker(workspaceRoot);
 
-    const chatProvider = new ChatViewProvider(context.extensionUri, client);
+    // Phase 2: agent loop wiring context retrieval + tool execution around the shared client.
+    agentSession = new AgentSession(client, toolRegistry, indexer, ranker, ignoreService);
+
+    const chatProvider = new ChatViewProvider(context.extensionUri, agentSession);
     context.subscriptions.push(
         vscode.window.registerWebviewViewProvider(
             ChatViewProvider.viewType,
@@ -179,6 +184,10 @@ export function getRelevanceRanker(): RelevanceRanker {
 
 export function getIgnoreService(): IgnoreService {
     return ignoreService;
+}
+
+export function getAgentSession(): AgentSession {
+    return agentSession;
 }
 
 export function deactivate() {

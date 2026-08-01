@@ -1,7 +1,7 @@
 import Database from 'better-sqlite3';
 import * as fs from 'fs';
 import * as path from 'path';
-import { CodeChunk, EmbeddedChunk, ScoredChunk } from './types';
+import { CodeChunk, ScoredChunk } from './types';
 
 interface EmbeddingModel {
   embed(text: string): Promise<Float32Array>;

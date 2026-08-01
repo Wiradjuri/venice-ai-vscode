@@ -3,7 +3,7 @@ import * as fs from 'fs';
 import { Chunker } from './chunker';
 import { EmbeddingStore } from './embeddingStore';
 import { IgnoreService } from '../security/ignoreService';
-import { IndexStatus } from './types';
+import { IndexStatus, ScoredChunk } from './types';
 
 const INDEXABLE_GLOB = '**/*.{ts,tsx,js,jsx,py,go,rs,java,rb,cpp,c,h,hpp}';
 const EXCLUDE_GLOB = '**/{node_modules,.git,.vscode,dist,build,.next,out}/**';
@@ -150,6 +150,20 @@ export class WorkspaceIndexer {
 
   getStatus(): IndexStatus {
     return { ...this.indexStatus, sizeBytes: this.embeddingStore.getDatabaseSizeBytes() };
+  }
+
+  /**
+   * Top-K similar chunks for a query, for Phase 2 context assembly. Best-effort: if the
+   * embedding model hasn't been loaded yet (e.g. "Venice: Rebuild Index" was never run), this
+   * returns an empty result instead of throwing, so a chat turn still proceeds without context.
+   */
+  async query(text: string, k: number = 10): Promise<ScoredChunk[]> {
+    try {
+      return await this.embeddingStore.query(text, k);
+    } catch (error) {
+      console.warn('Venice: index query failed (index may not be built yet)', error);
+      return [];
+    }
   }
 
   private async findFiles(): Promise<vscode.Uri[]> {

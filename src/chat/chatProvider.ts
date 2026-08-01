@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
-import { VeniceClient, ChatMessage, VeniceCircuitOpenError } from '../api/venice';
+import { ChatMessage, VeniceCircuitOpenError } from '../api/venice';
+import { AgentSession } from '../agent';
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
     public static readonly viewType = 'venice.chatView';
@@ -9,7 +10,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     constructor(
         private readonly extensionUri: vscode.Uri,
-        private readonly client: VeniceClient
+        private readonly agentSession: AgentSession
     ) {}
 
     resolveWebviewView(
@@ -61,26 +62,31 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private async handleChat(userMessage: string): Promise<void> {
         if (!this.webviewView) return;
 
-        this.history.push({ role: 'user', content: userMessage });
-
         this.webviewView.webview.postMessage({
             type: 'userMessage',
             text: userMessage
         });
 
         try {
-            let fullResponse = '';
             this.webviewView.webview.postMessage({ type: 'streamStart' });
 
-            for await (const chunk of this.client.chatStream(this.history)) {
-                fullResponse += chunk;
-                this.webviewView.webview.postMessage({
-                    type: 'streamChunk',
-                    text: chunk
-                });
-            }
+            // The agent loop uses non-streaming calls under the hood (tool_calls need to arrive
+            // whole before they can be executed), so progress is surfaced via toolCall/toolResult
+            // events instead of token-by-token chunks; the final answer arrives as one chunk.
+            const result = await this.agentSession.run(userMessage, this.history, (event) => {
+                if (!this.webviewView) return;
+                if (event.type === 'toolCall') {
+                    this.webviewView.webview.postMessage({ type: 'toolCall', name: event.name });
+                } else {
+                    this.webviewView.webview.postMessage({ type: 'toolResult', name: event.name, success: event.success });
+                }
+            });
 
-            this.history.push({ role: 'assistant', content: fullResponse });
+            // Only append to persistent history once the turn fully succeeds, so a failure
+            // partway through a tool-calling round doesn't leave the conversation corrupted.
+            this.history.push(...result.messages);
+
+            this.webviewView.webview.postMessage({ type: 'streamChunk', text: result.reply });
             this.webviewView.webview.postMessage({ type: 'streamEnd' });
 
         } catch (error) {
@@ -100,7 +106,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     text: errorMessage
                 });
             }
-            this.history.pop();
         }
     }
 
@@ -298,6 +303,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             align-self: center;
             max-width: 90%;
         }
+        .tool-message {
+            align-self: flex-start;
+            font-size: 0.78em;
+            font-family: var(--vscode-editor-font-family);
+            padding: 3px 10px;
+            border-radius: 10px;
+            background: var(--vscode-badge-background);
+            color: var(--vscode-badge-foreground);
+            opacity: 0.85;
+        }
         #circuit-banner {
             display: none;
             padding: 8px 12px;
@@ -428,6 +443,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
         let currentAssistantMessage = null;
         let isStreaming = false;
+        // The "Thinking..."/tool-activity pill shown while the agent loop is running, before the
+        // final answer bubble exists.
+        let pendingToolIndicator = null;
+
+        function clearPendingIndicator() {
+            if (pendingToolIndicator) {
+                pendingToolIndicator.remove();
+                pendingToolIndicator = null;
+            }
+        }
 
         function escapeHtml(text) {
             const div = document.createElement('div');
@@ -480,6 +505,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             return msg;
         }
 
+        function addToolMessage(text) {
+            hideEmptyState();
+            const el = document.createElement('div');
+            el.className = 'tool-message';
+            el.textContent = text;
+            messagesEl.appendChild(el);
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+            return el;
+        }
+
         function send(overrideText) {
             const text = (overrideText !== undefined ? overrideText : input.value).trim();
             if (!text || isStreaming) return;
@@ -511,6 +546,63 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             input.style.height = Math.min(input.scrollHeight, 120) + 'px';
         });
 
+        function handleToolCall(message) {
+            clearPendingIndicator();
+            addToolMessage('🔧 ' + message.name + '...');
+        }
+
+        function handleToolResult(message) {
+            addToolMessage((message.success ? '✓ ' : '✗ ') + message.name);
+        }
+
+        function handleStreamChunk(message) {
+            clearPendingIndicator();
+            if (!currentAssistantMessage) {
+                currentAssistantMessage = addMessage('', 'assistant');
+            }
+            const existingText = currentAssistantMessage.getAttribute('data-raw') || '';
+            const newText = existingText + message.text;
+            currentAssistantMessage.setAttribute('data-raw', newText);
+            currentAssistantMessage.innerHTML = formatMessage(newText);
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+        }
+
+        function handleStreamEnd() {
+            isStreaming = false;
+            sendBtn.disabled = false;
+            clearPendingIndicator();
+            currentAssistantMessage = null;
+        }
+
+        function clearCurrentMessage() {
+            clearPendingIndicator();
+            if (currentAssistantMessage) {
+                currentAssistantMessage.closest('.message-row')?.remove();
+                currentAssistantMessage = null;
+            }
+        }
+
+        function handleError(message) {
+            isStreaming = false;
+            sendBtn.disabled = false;
+            clearCurrentMessage();
+            addMessage(message.text, 'error');
+        }
+
+        function handleCircuitBanner(message) {
+            isStreaming = false;
+            sendBtn.disabled = false;
+            clearCurrentMessage();
+            circuitBanner.textContent = '⚠ ' + message.text;
+            circuitBanner.classList.add('visible');
+        }
+
+        function handleCleared() {
+            messagesEl.innerHTML = '';
+            emptyState.style.display = 'flex';
+            circuitBanner.classList.remove('visible');
+        }
+
         window.addEventListener('message', (event) => {
             const message = event.data;
 
@@ -518,58 +610,35 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 case 'userMessage':
                     addMessage(message.text, 'user');
                     break;
-
                 case 'streamStart':
                     isStreaming = true;
                     sendBtn.disabled = true;
                     circuitBanner.classList.remove('visible');
-                    currentAssistantMessage = addMessage('', 'assistant');
-                    currentAssistantMessage.innerHTML = '<span class="typing-indicator">Thinking</span>';
-                    break;
-
-                case 'streamChunk':
-                    if (currentAssistantMessage) {
-                        const existingText = currentAssistantMessage.getAttribute('data-raw') || '';
-                        const newText = existingText + message.text;
-                        currentAssistantMessage.setAttribute('data-raw', newText);
-                        currentAssistantMessage.innerHTML = formatMessage(newText);
-                        chatContainer.scrollTop = chatContainer.scrollHeight;
-                    }
-                    break;
-
-                case 'streamEnd':
-                    isStreaming = false;
-                    sendBtn.disabled = false;
                     currentAssistantMessage = null;
+                    pendingToolIndicator = addToolMessage('');
+                    pendingToolIndicator.innerHTML = '<span class="typing-indicator">Thinking</span>';
                     break;
-
+                case 'toolCall':
+                    handleToolCall(message);
+                    break;
+                case 'toolResult':
+                    handleToolResult(message);
+                    break;
+                case 'streamChunk':
+                    handleStreamChunk(message);
+                    break;
+                case 'streamEnd':
+                    handleStreamEnd();
+                    break;
                 case 'error':
-                    isStreaming = false;
-                    sendBtn.disabled = false;
-                    if (currentAssistantMessage) {
-                        currentAssistantMessage.closest('.message-row')?.remove();
-                        currentAssistantMessage = null;
-                    }
-                    addMessage(message.text, 'error');
+                    handleError(message);
                     break;
-
                 case 'circuitBanner':
-                    isStreaming = false;
-                    sendBtn.disabled = false;
-                    if (currentAssistantMessage) {
-                        currentAssistantMessage.closest('.message-row')?.remove();
-                        currentAssistantMessage = null;
-                    }
-                    circuitBanner.textContent = '⚠ ' + message.text;
-                    circuitBanner.classList.add('visible');
+                    handleCircuitBanner(message);
                     break;
-
                 case 'cleared':
-                    messagesEl.innerHTML = '';
-                    emptyState.style.display = 'flex';
-                    circuitBanner.classList.remove('visible');
+                    handleCleared();
                     break;
-
                 case 'model':
                     modelBadge.textContent = message.text;
                     break;

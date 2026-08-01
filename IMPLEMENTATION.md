@@ -1,11 +1,12 @@
-# Phase 1, 3 & 4 Implementation Summary
+# Phase 1-4 Implementation Summary
 
 ## Overview
 
-Phase 1 (Foundational Context Indexing), Phase 3 (Tooling & Permissions), and Phase 4 (Security,
-Performance, and Polish) have been implemented for the Venice AI VS Code extension, enabling
-repository-wide semantic understanding, safe tool execution, and hardening against leaking
-sensitive content, unhealthy backends, and large monorepos.
+Phase 1 (Foundational Context Indexing), Phase 2 (Agent Loop), Phase 3 (Tooling & Permissions),
+and Phase 4 (Security, Performance, and Polish) have been implemented for the Venice AI VS Code
+extension, enabling repository-wide semantic understanding, an agentic chat loop with tool use,
+safe tool execution, and hardening against leaking sensitive content, unhealthy backends, and
+large monorepos.
 
 ## Phase 1: Context Indexing
 
@@ -50,7 +51,7 @@ sensitive content, unhealthy backends, and large monorepos.
 ### Integration
 
 - **extension.ts**: Initializes `WorkspaceIndexer` on activation, registers file watcher, adds `venice.rebuildIndex` command
-- **Future (Phase 2)**: Chat provider will call `ranker.rank(embeddingStore.query(userMessage))` before sending to Venice
+- **Phase 2**: `AgentSession` calls `indexer.query()` → `ranker.rank()` before sending to Venice; see below
 
 ### Dependencies Added
 
@@ -58,6 +59,84 @@ sensitive content, unhealthy backends, and large monorepos.
 - `@xenova/transformers@^2.7.0` — local embedding model (ONNX)
 - `ignore@^5.3.0` — .gitignore/.veniceignore parsing
 - `@types/better-sqlite3` — TypeScript types
+
+---
+
+## Phase 2: Agent Loop
+
+### Components Implemented
+
+**1. AgentSession** (`src/agent/agentSession.ts`)
+- Drives the tool-calling loop for a single chat turn, replacing the old plain `chatStream()`
+  call in `ChatViewProvider`
+- **Context assembly**: on every turn, embeds the user's message via
+  `WorkspaceIndexer.query()`, re-ranks with `RelevanceRanker.rank()` (after pointing it at the
+  active editor with `setCurrentFile()`), filters out any chunk from a file `IgnoreService`
+  excludes, and packs the top matches into an ephemeral `system` message under a fixed character
+  budget (6000 chars, top 8 chunks). This message is rebuilt fresh each turn and is never
+  persisted to history, so it doesn't accumulate turn over turn.
+- **Tool loop**: calls `VeniceClient.chat()` (non-streaming — a `tool_calls` message has to
+  arrive whole before it can be executed, so there's nothing to gain from streaming it) with
+  `ToolRegistry.getSchemas()`. While the response is a `ChatMessage` with `tool_calls` rather
+  than plain text, each call is executed via `ToolRegistry.execute()` — which still runs every
+  call through `PermissionManager`'s approval/denylist/path-confinement gate — and the result is
+  appended as a `role: 'tool'` message before calling Venice again. Stops and returns once a
+  plain-text answer arrives.
+- **Bounded**: caps at 8 tool-calling round-trips (`MAX_TOOL_ITERATIONS`) and 4000 chars per
+  tool result (`TOOL_RESULT_CHAR_CAP`) before truncating, so a runaway loop or an oversized
+  `read_file`/`search_workspace` result can't blow up the context window or hang the turn
+  indefinitely
+- Emits `toolCall`/`toolResult` events via an optional callback so the caller can show live
+  progress without needing to parse the message stream itself
+- Returns `{ reply, messages }`: the caller only appends `messages` to persistent history once
+  the whole turn succeeds, so a failure partway through a tool round doesn't leave a dangling
+  half-turn in history (mirrors the old pop-on-error behavior, but by construction instead of by
+  undo)
+- A fixed system prompt is prepended once, on the first turn of a conversation only (detected via
+  `history.length === 0`), instructing the model to use tools rather than guess at file contents
+
+### Integration
+
+- **extension.ts**: constructs one `AgentSession` from the already-shared `VeniceClient`,
+  `ToolRegistry`, `WorkspaceIndexer`, `RelevanceRanker`, and `IgnoreService`; passes it into
+  `ChatViewProvider` instead of the raw client; exports `getAgentSession()`
+- **chat/chatProvider.ts**: `handleChat()` now calls `agentSession.run()` instead of
+  `client.chatStream()`. The webview protocol gained two message types, `toolCall`/`toolResult`,
+  rendered as small pill-shaped status rows in the chat feed; the final answer still arrives via
+  the existing `streamStart`/`streamChunk`/`streamEnd` sequence (as a single chunk, since it's no
+  longer literally streamed) so the rest of the UI didn't need to change
+- Every model call inside the loop still goes through `VeniceClient`, so secret redaction, the
+  circuit breaker, and the `venice.enabled` workspace gate (Phase 4) all apply to agent turns for
+  free — nothing tool-related bypasses them
+
+### New Files
+
+```
+src/agent/
+  ├── agentSession.ts
+  └── index.ts
+```
+
+### Testing
+
+```bash
+npm run compile                  # Verify TS compilation
+vscode F5                        # Launch Extension Host
+# In VS Code:
+# 1. Run "Venice: Rebuild Index" first so context assembly has something to retrieve
+# 2. Open the Venice chat, ask "what does this file do?" with a file open — confirm a
+#    "Thinking..." pill appears, then the answer references the actual file content
+# 3. Ask something that requires a tool, e.g. "list the files in src/tools" — confirm a
+#    "🔧 list_directory..." pill appears, then a "✓ list_directory" pill, then the final answer
+# 4. Ask for something requiring approval, e.g. "run `echo hello` in the terminal" — confirm the
+#    same PermissionManager approval dialog from Phase 3 still appears mid-turn
+# 5. Deny a tool call — confirm the agent receives the denial as a tool result and can respond
+#    sensibly (e.g. explain it couldn't complete the action) instead of the turn crashing
+# 6. Multi-turn: after a successful tool-using turn, send a follow-up question — confirm history
+#    (including prior tool calls/results) round-trips correctly and the model has that context
+# 7. Force an error (e.g. temporarily rename `rg` off PATH mid-search) — confirm the turn shows
+#    the normal error bubble and history is unchanged (no dangling half-turn)
+```
 
 ---
 
@@ -302,6 +381,10 @@ src/context/
   ├── workspaceIndexer.ts
   └── index.ts
 
+src/agent/
+  ├── agentSession.ts
+  └── index.ts
+
 src/tools/
   ├── permissionManager.ts
   ├── toolRegistry.ts
@@ -323,12 +406,15 @@ src/api/
 ### Modified Files
 ```
 src/extension.ts                 # Wire indexer/tools/ranker; construct one shared VeniceClient +
-                                  # IgnoreService; register new commands
+                                  # IgnoreService + AgentSession; register new commands
 src/api/venice.ts                # Tool-calling support; circuit breaker + backoff; workspace-enabled
                                   # gate; secret redaction on outgoing messages
-src/chat/chatProvider.ts         # Takes a shared VeniceClient; circuit-open banner UI
+src/chat/chatProvider.ts         # Takes an AgentSession instead of a raw VeniceClient; runs the
+                                  # tool-calling loop per turn; toolCall/toolResult UI; circuit-open
+                                  # banner UI
 src/completion/inlineProvider.ts # Takes a shared VeniceClient; .veniceignore + workspace-enabled checks
-src/context/workspaceIndexer.ts  # Shared IgnoreService; hot-set prioritization; size cap; event-loop yield
+src/context/workspaceIndexer.ts  # Shared IgnoreService; hot-set prioritization; size cap; event-loop
+                                  # yield; query() for Phase 2 context retrieval
 src/context/embeddingStore.ts    # getDatabaseSizeBytes()
 src/context/types.ts             # IndexStatus: sizeBytes, sizeCapped
 package.json                     # Dependencies: better-sqlite3, transformers, ignore, shell-quote;
@@ -351,34 +437,17 @@ package.json                     # Dependencies: better-sqlite3, transformers, i
    front of every network call, not bolted onto individual features
 8. **One client, one circuit**: chat and completions share a single `VeniceClient` so backend
    health (and the workspace-enabled toggle) is consistent across the whole extension
-
----
-
-## Phase 2 Readiness
-
-The extension now has all infrastructure for Phase 2 (Agent Loop):
-- `VeniceClient` supports tool-calling, and already gates/redacts/circuit-breaks every call, so
-  Phase 2's context-assembly step inherits that protection for free
-- `ToolRegistry.getSchemas()` provides OpenAI-compatible tool definitions
-- `ToolRegistry.execute(toolCall)` handles approval + execution
-- `RelevanceRanker` provides multi-signal ranking for context assembly
-- `IgnoreService` is available for Phase 2's context assembly to skip excluded chunks before
-  they're ever added to a prompt (today it's only wired into inline completions)
-- `getIndexer()`, `getToolRegistry()`, `getRelevanceRanker()`, `getIgnoreService()` exported from
-  extension.ts
-
-Phase 2 implementation will create `AgentSession` class that:
-1. Calls `indexer.query(userMessage)` → rank → assemble context
-2. Calls `veniceClient.chat(messages, {tools: toolRegistry.getSchemas()})`
-3. Loops while `finish_reason === 'tool_calls'`, executing tools and appending results
-4. Returns final assistant message
+9. **Agent tool calls inherit every network safeguard for free**: `AgentSession` never talks to
+   Venice directly — every round of the tool loop goes through the same shared `VeniceClient`, so
+   secret redaction, the circuit breaker, and the workspace-enabled kill switch all apply exactly
+   as they do to a plain chat message
 
 ---
 
 ## Rollback
 
 All changes are reversible:
-- Delete `src/context/`, `src/tools/`, `src/security/`, and `src/api/circuitBreaker.ts`
+- Delete `src/context/`, `src/agent/`, `src/tools/`, `src/security/`, and `src/api/circuitBreaker.ts`
 - Remove dependencies: `npm uninstall better-sqlite3 @xenova/transformers ignore shell-quote @types/better-sqlite3`
 - Revert `src/extension.ts`, `src/api/venice.ts`, `src/chat/chatProvider.ts`, and
   `src/completion/inlineProvider.ts` to original

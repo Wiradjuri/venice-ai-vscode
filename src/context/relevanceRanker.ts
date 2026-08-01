@@ -2,6 +2,19 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import { CodeChunk, ScoredChunk } from './types';
 
+// Scoring weights
+const EMBEDDING_WEIGHT = 0.5;
+const IMPORT_DISTANCE_WEIGHT = 0.2;
+const PATH_PROXIMITY_WEIGHT = 0.15;
+const RECENCY_WEIGHT = 0.15;
+
+// Distance constants
+const SAME_DIRECTORY_DISTANCE = 0.2;
+const DEPTH_MULTIPLIER = 0.3;
+const PATH_DEPTH_UNIT = 30;
+const RECENCY_UNKNOWN_SCORE = 0.3;
+const RECENCY_DECAY_HOURS = 168; // 1 week
+
 export class RelevanceRanker {
   private workspaceRoot: string;
   private currentFileUri: string = '';
@@ -17,9 +30,9 @@ export class RelevanceRanker {
   /**
    * Re-rank scored chunks using multiple signals
    */
-  async rank(scored: ScoredChunk[]): Promise<ScoredChunk[]> {
+  async rank(scored: readonly ScoredChunk[]): Promise<ScoredChunk[]> {
     // Compute additional signals for each chunk
-    const enhanced = scored.map(item => {
+    const enhanced = scored.map((item: ScoredChunk) => {
       const signals = {
         embeddingScore: item.score, // already set by EmbeddingStore
         importDistance: this.computeImportDistance(item.chunk),
@@ -28,11 +41,12 @@ export class RelevanceRanker {
       };
 
       // Combine signals into final score
+      const INVERSE_IMPORT_DISTANCE = 1 - signals.importDistance;
       const finalScore =
-        signals.embeddingScore * 0.5 + // embedding similarity is primary
-        (1 - signals.importDistance) * 0.2 + // prefer nearby imports
-        signals.pathProximity * 0.15 + // prefer nearby paths
-        signals.recencyScore * 0.15; // prefer recently edited
+        signals.embeddingScore * EMBEDDING_WEIGHT + // embedding similarity is primary
+        INVERSE_IMPORT_DISTANCE * IMPORT_DISTANCE_WEIGHT + // prefer nearby imports
+        signals.pathProximity * PATH_PROXIMITY_WEIGHT + // prefer nearby paths
+        signals.recencyScore * RECENCY_WEIGHT; // prefer recently edited
 
       return {
         ...item,
