@@ -166,9 +166,11 @@
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "package": "vsce package"
+    "package": "vsce package",
+    "postinstall": "electron-rebuild -f -w better-sqlite3"
   },
   "devDependencies": {
+    "@electron/rebuild": "^4.2.0",
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^20.10.0",
     "@types/vscode": "^1.93.0",
