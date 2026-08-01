@@ -134,11 +134,18 @@ export class VeniceClient {
             } catch (error) {
                 lastError = error;
                 const retryable = isRetryableError(error);
-                if (!retryable || attempt === MAX_RETRIES) {
-                    this.circuitBreaker.onFailure();
+                // Only network-level failures and 429/5xx count against the circuit — a 4xx like
+                // a bad API key is a client-side problem, not a sign the backend is unhealthy,
+                // and shouldn't trip a breaker that then blocks a legitimate retry after the fix.
+                if (retryable) {
+                    if (attempt === MAX_RETRIES) {
+                        this.circuitBreaker.onFailure();
+                        throw error;
+                    }
+                    await sleep(BACKOFF_BASE_MS * 2 ** attempt + Math.random() * 100);
+                } else {
                     throw error;
                 }
-                await sleep(BACKOFF_BASE_MS * 2 ** attempt + Math.random() * 100);
             }
         }
         // Unreachable, but keeps TS happy about the return type.

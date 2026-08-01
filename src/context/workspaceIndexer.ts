@@ -1,15 +1,22 @@
 import * as vscode from 'vscode';
-import * as path from 'path';
-import { Ignore } from 'ignore';
-import ignore from 'ignore';
+import * as fs from 'fs';
 import { Chunker } from './chunker';
 import { EmbeddingStore } from './embeddingStore';
-import { CodeChunk, IndexStatus } from './types';
+import { IgnoreService } from '../security/ignoreService';
+import { IndexStatus } from './types';
+
+const INDEXABLE_GLOB = '**/*.{ts,tsx,js,jsx,py,go,rs,java,rb,cpp,c,h,hpp}';
+const EXCLUDE_GLOB = '**/{node_modules,.git,.vscode,dist,build,.next,out}/**';
+// Number of files treated as "recently touched" and indexed before the rest of the sweep,
+// on top of any file that's currently open in an editor.
+const HOT_SET_SIZE = 200;
+// Yield to the extension host event loop after this many files so indexing never blocks typing.
+const YIELD_EVERY_N_FILES = 5;
+const DEFAULT_MAX_INDEX_SIZE_MB = 200;
 
 export class WorkspaceIndexer {
   private chunker: Chunker;
   private embeddingStore: EmbeddingStore;
-  private ignorer: Ignore;
   private indexStatus: IndexStatus = {
     state: 'idle',
     filesIndexed: 0,
@@ -17,95 +24,88 @@ export class WorkspaceIndexer {
     progress: 0,
   };
   private fileWatcher: vscode.FileSystemWatcher | null = null;
+  private ignoreFileWatcher: vscode.FileSystemWatcher | null = null;
   private debounceMap = new Map<string, NodeJS.Timeout>();
   private statusBarItem: vscode.StatusBarItem;
   private onDidChangeIndexStatus = new vscode.EventEmitter<IndexStatus>();
   public onIndexStatusChange = this.onDidChangeIndexStatus.event;
 
-  constructor(private context: vscode.ExtensionContext) {
+  constructor(
+    private context: vscode.ExtensionContext,
+    private ignoreService: IgnoreService
+  ) {
     this.chunker = new Chunker();
     this.embeddingStore = new EmbeddingStore(context.globalStorageUri.fsPath);
-    this.ignorer = this.buildIgnorer();
     this.statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
-    this.statusBarItem.command = 'venice.rebuildIndex';
+    this.statusBarItem.command = 'venice.showIndexStatus';
     this.updateStatusBar();
   }
 
-  private buildIgnorer(): Ignore {
-    const ig = ignore();
-
-    // Add .gitignore patterns
-    try {
-      const gitignorePath = path.join(vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '', '.gitignore');
-      const fs = require('fs');
-      const content = fs.readFileSync(gitignorePath, 'utf-8');
-      ig.add(content);
-    } catch {
-      // .gitignore not found, continue
-    }
-
-    // Add .veniceignore patterns
-    try {
-      const veniceignorePath = path.join(
-        vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '',
-        '.veniceignore'
-      );
-      const fs = require('fs');
-      const content = fs.readFileSync(veniceignorePath, 'utf-8');
-      ig.add(content);
-    } catch {
-      // .veniceignore not found, continue
-    }
-
-    // Add common exclusions
-    ig.add(['node_modules', '.git', '.vscode', 'dist', 'build', '.next', 'out']);
-
-    return ig;
+  private getMaxIndexSizeBytes(): number {
+    const config = vscode.workspace.getConfiguration('venice');
+    const mb = config.get<number>('maxIndexSizeMB', DEFAULT_MAX_INDEX_SIZE_MB);
+    return Math.max(1, mb) * 1024 * 1024;
   }
 
   async buildInitialIndex(): Promise<void> {
-    if (this.indexStatus.state === 'indexing' || this.indexStatus.state === 'error') {
-      if (this.indexStatus.state === 'indexing') {
-        return; // Already indexing
-      }
-      // Clear error state and try again
+    if (this.indexStatus.state === 'indexing') {
+      return; // Already indexing
     }
 
-    this.updateIndexStatus({ state: 'indexing', filesIndexed: 0, progress: 0 });
+    this.updateIndexStatus({ state: 'indexing', filesIndexed: 0, progress: 0, sizeCapped: false, error: undefined });
 
     try {
       // Load embedding model
       await this.embeddingStore.loadModel();
 
-      // Find all files
+      // Find + prioritize files: open editors and recently-modified files first, so the most
+      // relevant part of a large monorepo is searchable long before a full sweep finishes.
       const files = await this.findFiles();
-      this.updateIndexStatus({ totalFiles: files.length });
+      const ordered = await this.prioritizeFiles(files);
+      this.updateIndexStatus({ totalFiles: ordered.length });
 
-      // Index each file
-      for (let i = 0; i < files.length; i++) {
+      const maxSizeBytes = this.getMaxIndexSizeBytes();
+
+      for (let i = 0; i < ordered.length; i++) {
         if ((this.indexStatus.state as string) !== 'indexing') {
           break; // Cancelled or error
         }
 
+        if (this.embeddingStore.getDatabaseSizeBytes() >= maxSizeBytes) {
+          this.updateIndexStatus({ sizeCapped: true });
+          console.warn(`Venice index stopped: reached ${maxSizeBytes / (1024 * 1024)}MB cap`);
+          break;
+        }
+
         try {
-          const document = await vscode.workspace.openTextDocument(files[i]);
+          const document = await vscode.workspace.openTextDocument(ordered[i]);
           const chunks = await this.chunker.chunkDocument(document);
 
-          // Embed and store each chunk
           for (const chunk of chunks) {
             await this.embeddingStore.upsert(chunk);
           }
 
           this.updateIndexStatus({
             filesIndexed: i + 1,
-            progress: Math.round(((i + 1) / files.length) * 100),
+            progress: Math.round(((i + 1) / ordered.length) * 100),
+            sizeBytes: this.embeddingStore.getDatabaseSizeBytes(),
           });
         } catch (error) {
-          console.warn(`Failed to index ${files[i].fsPath}:`, error);
+          console.warn(`Failed to index ${ordered[i].fsPath}:`, error);
+        }
+
+        // Never hog the event loop: indexing must not block typing/UI responsiveness.
+        if (i % YIELD_EVERY_N_FILES === YIELD_EVERY_N_FILES - 1) {
+          await new Promise<void>(resolve => setImmediate(resolve));
         }
       }
 
-      this.updateIndexStatus({ state: 'idle', progress: 100 });
+      this.updateIndexStatus({
+        state: 'idle',
+        progress: this.indexStatus.sizeCapped ? this.indexStatus.progress : 100,
+        sizeBytes: this.embeddingStore.getDatabaseSizeBytes(),
+        lastUpdated: Date.now(),
+      });
     } catch (error) {
       console.error('Indexing error:', error);
       this.updateIndexStatus({
@@ -132,6 +132,8 @@ export class WorkspaceIndexer {
         for (const chunk of chunks) {
           await this.embeddingStore.upsert(chunk);
         }
+
+        this.updateIndexStatus({ sizeBytes: this.embeddingStore.getDatabaseSizeBytes() });
       } catch (error) {
         console.warn(`Failed to reindex ${uri.fsPath}:`, error);
       }
@@ -147,18 +149,42 @@ export class WorkspaceIndexer {
   }
 
   getStatus(): IndexStatus {
-    return { ...this.indexStatus };
+    return { ...this.indexStatus, sizeBytes: this.embeddingStore.getDatabaseSizeBytes() };
   }
 
   private async findFiles(): Promise<vscode.Uri[]> {
-    const exclude = '**/{node_modules,.git,.vscode,dist,build,.next,out}/**';
-    const files = await vscode.workspace.findFiles('**/*.{ts,tsx,js,jsx,py,go,rs,java,rb,cpp,c,h,hpp}', exclude);
+    const files = await vscode.workspace.findFiles(INDEXABLE_GLOB, EXCLUDE_GLOB);
 
-    // Filter by ignore rules
-    return files.filter(file => {
-      const relPath = path.relative(vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '', file.fsPath);
-      return !this.ignorer.ignores(relPath);
+    // Filter by .gitignore/.veniceignore rules
+    return files.filter(file => !this.ignoreService.isIgnored(file.fsPath));
+  }
+
+  /**
+   * Orders files so the "hot set" — currently open editors plus the most recently modified
+   * files on disk — is indexed first. The rest of a large repo is swept in the background
+   * afterward, so search/context quality for what the user is actively working on is available
+   * almost immediately instead of waiting on a full-repo pass.
+   */
+  private async prioritizeFiles(files: vscode.Uri[]): Promise<vscode.Uri[]> {
+    const openUris = new Set(vscode.workspace.textDocuments.map(doc => doc.uri.toString()));
+
+    const withMtime = files.map(file => {
+      let mtimeMs = 0;
+      try {
+        mtimeMs = fs.statSync(file.fsPath).mtimeMs;
+      } catch {
+        // File may have been deleted between findFiles() and here; sorts last.
+      }
+      return { file, mtimeMs, isOpen: openUris.has(file.toString()) };
     });
+
+    const open = withMtime.filter(f => f.isOpen);
+    const rest = withMtime.filter(f => !f.isOpen).sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+    const hotRest = rest.slice(0, Math.max(0, HOT_SET_SIZE - open.length));
+    const cold = rest.slice(hotRest.length);
+
+    return [...open, ...hotRest, ...cold].map(f => f.file);
   }
 
   private updateIndexStatus(partial: Partial<IndexStatus>): void {
@@ -168,7 +194,7 @@ export class WorkspaceIndexer {
   }
 
   private updateStatusBar(): void {
-    const { state, filesIndexed, totalFiles, progress } = this.indexStatus;
+    const { state, filesIndexed, totalFiles, progress, sizeCapped } = this.indexStatus;
 
     switch (state) {
       case 'indexing':
@@ -177,7 +203,9 @@ export class WorkspaceIndexer {
         break;
       case 'idle':
         if (filesIndexed > 0) {
-          this.statusBarItem.text = `$(search) Venice Index: ${filesIndexed} files`;
+          this.statusBarItem.text = sizeCapped
+            ? `$(warning) Venice Index: ${filesIndexed} files (capped)`
+            : `$(search) Venice Index: ${filesIndexed} files`;
           this.statusBarItem.show();
         } else {
           this.statusBarItem.hide();
@@ -191,7 +219,7 @@ export class WorkspaceIndexer {
   }
 
   registerFileWatcher(): vscode.Disposable {
-    this.fileWatcher = vscode.workspace.createFileSystemWatcher('**/*.{ts,tsx,js,jsx,py,go,rs,java,rb,cpp,c,h,hpp}');
+    this.fileWatcher = vscode.workspace.createFileSystemWatcher(INDEXABLE_GLOB);
 
     const onChangeDisposable = this.fileWatcher.onDidChange(uri => {
       this.reindexFile(uri);
@@ -205,11 +233,21 @@ export class WorkspaceIndexer {
       this.removeFile(uri);
     });
 
-    return vscode.Disposable.from(onChangeDisposable, onCreateDisposable, onDeleteDisposable);
+    // Keep the shared ignore rules in sync with .gitignore/.veniceignore edits, so a newly
+    // excluded file stops being sent immediately rather than after the extension reloads.
+    this.ignoreFileWatcher = vscode.workspace.createFileSystemWatcher('**/{.gitignore,.veniceignore}');
+    const onIgnoreChangeDisposable = vscode.Disposable.from(
+      this.ignoreFileWatcher.onDidChange(() => this.ignoreService.reload()),
+      this.ignoreFileWatcher.onDidCreate(() => this.ignoreService.reload()),
+      this.ignoreFileWatcher.onDidDelete(() => this.ignoreService.reload())
+    );
+
+    return vscode.Disposable.from(onChangeDisposable, onCreateDisposable, onDeleteDisposable, onIgnoreChangeDisposable);
   }
 
   dispose(): void {
     this.fileWatcher?.dispose();
+    this.ignoreFileWatcher?.dispose();
     this.statusBarItem.dispose();
     this.embeddingStore.close();
   }

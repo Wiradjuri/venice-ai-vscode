@@ -1,4 +1,5 @@
 import Database from 'better-sqlite3';
+import * as fs from 'fs';
 import * as path from 'path';
 import { CodeChunk, EmbeddedChunk, ScoredChunk } from './types';
 
@@ -8,13 +9,23 @@ interface EmbeddingModel {
 
 export class EmbeddingStore {
   private db: Database.Database;
+  private dbPath: string;
   private model: EmbeddingModel | null = null;
   private modelLoaded = false;
 
   constructor(storagePath: string) {
-    const dbPath = path.join(storagePath, 'venice-index.db');
-    this.db = new Database(dbPath);
+    this.dbPath = path.join(storagePath, 'venice-index.db');
+    this.db = new Database(this.dbPath);
     this.initSchema();
+  }
+
+  /** On-disk size of the index database in bytes (0 if it hasn't been created yet). */
+  getDatabaseSizeBytes(): number {
+    try {
+      return fs.statSync(this.dbPath).size;
+    } catch {
+      return 0;
+    }
   }
 
   private initSchema(): void {

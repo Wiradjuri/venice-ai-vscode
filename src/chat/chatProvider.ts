@@ -1,19 +1,16 @@
 import * as vscode from 'vscode';
-import { VeniceClient, ChatMessage } from '../api/venice';
+import { VeniceClient, ChatMessage, VeniceCircuitOpenError } from '../api/venice';
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
     public static readonly viewType = 'venice.chatView';
 
     private webviewView?: vscode.WebviewView;
-    private client: VeniceClient;
     private history: ChatMessage[] = [];
 
     constructor(
         private readonly extensionUri: vscode.Uri,
-        context: vscode.ExtensionContext
-    ) {
-        this.client = new VeniceClient(context);
-    }
+        private readonly client: VeniceClient
+    ) {}
 
     resolveWebviewView(
         webviewView: vscode.WebviewView,
@@ -72,11 +69,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             this.webviewView.webview.postMessage({ type: 'streamEnd' });
 
         } catch (error) {
-            const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-            this.webviewView.webview.postMessage({
-                type: 'error',
-                text: errorMessage
-            });
+            if (error instanceof VeniceCircuitOpenError) {
+                // Persistent banner instead of a per-message bubble: the backend is down for
+                // everyone right now, not just this one request, so don't make it look like a
+                // one-off failure the user should retry immediately.
+                this.webviewView.webview.postMessage({
+                    type: 'circuitBanner',
+                    text: error.message,
+                    retryAfterMs: error.retryAfterMs
+                });
+            } else {
+                const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+                this.webviewView.webview.postMessage({
+                    type: 'error',
+                    text: errorMessage
+                });
+            }
             this.history.pop();
         }
     }
@@ -134,6 +142,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             border: 1px solid var(--vscode-inputValidation-errorBorder);
             color: var(--vscode-errorForeground);
             align-self: center;
+        }
+        #circuit-banner {
+            display: none;
+            padding: 8px 12px;
+            background: var(--vscode-inputValidation-warningBackground);
+            border-bottom: 1px solid var(--vscode-inputValidation-warningBorder);
+            color: var(--vscode-foreground);
+            font-size: 0.9em;
+        }
+        #circuit-banner.visible {
+            display: block;
         }
         pre {
             background: var(--vscode-textCodeBlock-background);
@@ -201,6 +220,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     </style>
 </head>
 <body>
+    <div id="circuit-banner"></div>
     <div id="chat-container"></div>
     <div id="input-container">
         <textarea id="input" placeholder="Ask Venice AI..." rows="1"></textarea>
@@ -210,6 +230,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     <script>
         const vscode = acquireVsCodeApi();
         const chatContainer = document.getElementById('chat-container');
+        const circuitBanner = document.getElementById('circuit-banner');
         const input = document.getElementById('input');
         const sendBtn = document.getElementById('send-btn');
 
@@ -276,6 +297,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 case 'streamStart':
                     isStreaming = true;
                     sendBtn.disabled = true;
+                    circuitBanner.classList.remove('visible');
                     currentAssistantMessage = addMessage('', 'assistant');
                     currentAssistantMessage.innerHTML = '<span class="typing-indicator">Thinking</span>';
                     break;
@@ -306,8 +328,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     addMessage(message.text, 'error');
                     break;
 
+                case 'circuitBanner':
+                    isStreaming = false;
+                    sendBtn.disabled = false;
+                    if (currentAssistantMessage) {
+                        currentAssistantMessage.remove();
+                        currentAssistantMessage = null;
+                    }
+                    circuitBanner.textContent = '⚠ ' + message.text;
+                    circuitBanner.classList.add('visible');
+                    break;
+
                 case 'cleared':
                     chatContainer.innerHTML = '';
+                    circuitBanner.classList.remove('visible');
                     break;
             }
         });

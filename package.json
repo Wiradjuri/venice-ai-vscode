@@ -33,6 +33,18 @@
       {
         "command": "venice.clearChat",
         "title": "Venice: Clear Chat History"
+      },
+      {
+        "command": "venice.rebuildIndex",
+        "title": "Venice: Rebuild Index"
+      },
+      {
+        "command": "venice.showIndexStatus",
+        "title": "Venice: Show Index Status"
+      },
+      {
+        "command": "venice.toggleWorkspaceEnabled",
+        "title": "Venice: Toggle Enabled for This Workspace"
       }
     ],
     "views": {
@@ -66,6 +78,17 @@
           "type": "number",
           "default": 50,
           "description": "Maximum lines of context to send for completions"
+        },
+        "venice.enabled": {
+          "type": "boolean",
+          "default": true,
+          "scope": "window",
+          "description": "Enable Venice AI for this workspace. Disable to stop all network calls (chat and completions) without removing the API key. Use \"Venice: Toggle Enabled for This Workspace\" to change this quickly."
+        },
+        "venice.maxIndexSizeMB": {
+          "type": "number",
+          "default": 200,
+          "description": "Maximum on-disk size (MB) of the local embedding index. The background indexing sweep stops early once this is reached; already-indexed files (open editors and recently modified files are prioritized) remain searchable."
         }
       }
     },

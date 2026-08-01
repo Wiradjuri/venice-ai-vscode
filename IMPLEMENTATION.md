@@ -1,8 +1,11 @@
-# Phase 1 & 3 Implementation Summary
+# Phase 1, 3 & 4 Implementation Summary
 
 ## Overview
 
-Phase 1 (Foundational Context Indexing) and Phase 3 (Tooling & Permissions) have been successfully implemented for the Venice AI VS Code extension, enabling repository-wide semantic understanding and safe tool execution.
+Phase 1 (Foundational Context Indexing), Phase 3 (Tooling & Permissions), and Phase 4 (Security,
+Performance, and Polish) have been implemented for the Venice AI VS Code extension, enabling
+repository-wide semantic understanding, safe tool execution, and hardening against leaking
+sensitive content, unhealthy backends, and large monorepos.
 
 ## Phase 1: Context Indexing
 
@@ -138,6 +141,99 @@ Phase 1 (Foundational Context Indexing) and Phase 3 (Tooling & Permissions) have
 
 ---
 
+## Phase 4: Security, Performance, and Polish
+
+### Components Implemented
+
+**1. Secrets** — no changes needed. The existing `context.secrets` pattern for the API key is
+already the correct, single storage mechanism; nothing to extend yet since there are no OAuth
+tokens in play.
+
+**2. Sensitive-code exclusion**
+- `IgnoreService` (`src/security/ignoreService.ts`): the single source of truth for
+  ".gitignore/.veniceignore" rules, extracted out of `WorkspaceIndexer` so the indexer and the
+  completion/chat path use *identical* rules instead of two independently-maintained copies.
+  Reloads automatically when `.gitignore`/`.veniceignore` change (watched in
+  `WorkspaceIndexer.registerFileWatcher()`).
+- `InlineCompletionProvider` now calls `ignoreService.isDocumentIgnored(document)` before ever
+  reading the document's text — an excluded file's content is never sent, even if it's the file
+  currently open and being edited. Previously there was no check at all here.
+- `secretScanner` (`src/security/secretScanner.ts`): pattern-based redaction (AWS access keys,
+  PEM private key blocks, GitHub/Slack tokens, generic `key`/`token`/`secret`/`password`
+  assignments, bearer tokens). Applied centrally in `VeniceClient.chat()`/`chatStream()` to every
+  outgoing message's `content` — one enforcement point that covers completions today and any
+  future Phase 2 context-assembly automatically, rather than redacting at each call site.
+- `workspaceGuard` (`src/security/workspaceGuard.ts`) + new `venice.enabled` setting +
+  **"Venice: Toggle Enabled for This Workspace"** command: a per-workspace kill switch checked by
+  `VeniceClient` before any network call. Disabling it doesn't delete the API key — it just stops
+  all outbound requests (chat throws a clear error surfaced as a chat bubble; completions
+  silently return `[]`, consistent with the existing missing-API-key behavior).
+
+**3. Network failures** (`src/api/circuitBreaker.ts`, `src/api/venice.ts`)
+- `CircuitBreaker`: closed → open after `N` consecutive failures (default 3) → half-open probe
+  after a cooldown (default 30s) → closed again on success.
+- Only network-level exceptions and HTTP 429/5xx responses count as failures; 4xx client errors
+  (e.g. a bad API key) don't trip the breaker — that's not a signal the *backend* is unhealthy,
+  and tripping on it would block a legitimate retry right after the user fixes the key.
+- `VeniceClient.fetchWithRetry()`: exponential backoff (300ms base, doubling, ±jitter) for up to
+  2 retries on retryable failures, before the circuit breaker's `onFailure()` fires.
+- On an open circuit, `VeniceClient` throws `VeniceCircuitOpenError` instead of attempting a
+  request. `ChatViewProvider` catches it specifically and shows a **persistent banner** in the
+  webview (distinct from the existing per-message error bubble) instead of a one-off error, since
+  the backend being down isn't specific to that one message. Inline completions already
+  catch-and-return-`[]` on any error, so an open circuit silently disables completions exactly as
+  a missing API key does — no change needed there.
+- **Refactor**: `ChatViewProvider` and `InlineCompletionProvider` previously each constructed
+  their own `VeniceClient`, so the circuit breaker would have been three independent, mostly-empty
+  breakers instead of one that actually reflects backend health. `extension.ts` now constructs a
+  single `VeniceClient` and passes it to both.
+
+**4. Large monorepos** (`src/context/workspaceIndexer.ts`, `src/context/embeddingStore.ts`)
+- **Hot-set prioritization**: before a full sweep, files are reordered so currently-open editors
+  and the 200 most-recently-modified files (by mtime) are indexed first. A large repo becomes
+  searchable for what the user is actively working on almost immediately, instead of waiting on a
+  full-repo pass.
+- **Index size cap**: new `venice.maxIndexSizeMB` setting (default 200MB). `EmbeddingStore` now
+  exposes `getDatabaseSizeBytes()`; `buildInitialIndex()` checks it before each file and stops the
+  background sweep early once the cap is hit, flagging `IndexStatus.sizeCapped` rather than
+  silently truncating.
+- **Event-loop yielding**: an explicit `await` on `setImmediate` every 5 files during indexing, so
+  a large initial sweep can't block the extension host and make typing/completions feel frozen.
+- **Incremental by content hash**: unchanged from Phase 1 — `EmbeddingStore.upsert()` already
+  skips re-embedding a chunk whose content hash hasn't changed, so re-running the indexer after
+  the first pass is cheap.
+- **"Venice: Show Index Status" command**: a modal summary (state, files indexed, on-disk size,
+  whether the size cap was hit, workspace-enabled state) instead of the indexing work being
+  invisible background activity the user can't inspect.
+- **Known limitation**: indexing and path confinement (`PermissionManager`) are anchored on the
+  *first* workspace folder only. `findFiles()` itself won't reach outside any open folder, so
+  nothing outside the workspace is ever indexed — but multi-root workspaces beyond the first
+  folder aren't correctly scoped yet. Fixing that is a larger refactor (every module that assumes
+  a single `workspaceRoot` would need to become folder-aware) and was left out of this pass to
+  keep it in scope.
+
+### Integration
+
+- **extension.ts**: constructs one `IgnoreService` and one `VeniceClient`, passes both into
+  `WorkspaceIndexer`, `InlineCompletionProvider`, and `ChatViewProvider`; registers
+  `venice.toggleWorkspaceEnabled` and `venice.showIndexStatus`; exports `getIgnoreService()`
+- **package.json**: new commands (`venice.rebuildIndex` — was previously registered but never
+  declared, `venice.showIndexStatus`, `venice.toggleWorkspaceEnabled`) and settings
+  (`venice.enabled`, `venice.maxIndexSizeMB`)
+
+### New Files
+```
+src/security/
+  ├── ignoreService.ts
+  ├── secretScanner.ts
+  └── workspaceGuard.ts
+
+src/api/
+  └── circuitBreaker.ts
+```
+
+---
+
 ## Testing
 
 ### Phase 1 Testing
@@ -169,6 +265,29 @@ vscode F5                        # Launch Extension Host
 # 9. Debug: debug_start with a configurationName from launch.json, set_breakpoint on an open file
 ```
 
+### Phase 4 Testing
+```bash
+# 1. .veniceignore exclusion: add a file to .veniceignore, open it, place the cursor mid-line —
+#    confirm no completion request fires (no network activity, no completion shown)
+# 2. Secret redaction: put `const apiKey = "sk-abcdefghijklmnopqrstuvwxyz123456"` in an open
+#    file near the cursor, trigger a completion — inspect the outgoing request (e.g. a proxy or
+#    breakpoint in fetchWithRetry) and confirm the assignment is replaced with [REDACTED:...]
+# 3. Workspace disable: run "Venice: Toggle Enabled for This Workspace" — confirm chat shows a
+#    clear "disabled for this workspace" error and completions stop firing; toggle back on
+# 4. Circuit breaker: point venice.model/API at an unreachable host (or revoke the key so the
+#    backend consistently 5xxs) and send 3 chat messages in a row — confirm the 4th shows the
+#    persistent circuit-open banner instead of a per-message error, and that inline completions
+#    silently stop rather than erroring
+# 5. Circuit breaker doesn't trip on bad auth: with an invalid API key (401), confirm repeated
+#    chat attempts each show a normal per-message auth error, not a circuit-open banner
+# 6. Index status: run "Venice: Show Index Status" — confirm it reports state/files/size/enabled
+# 7. Index size cap: set venice.maxIndexSizeMB very low (e.g. 1), rebuild the index on a repo
+#    larger than that — confirm indexing stops early and status reports sizeCapped: true
+# 8. Hot-set ordering: open a file deep in the tree, then rebuild the index — confirm (via
+#    console logs or timing) that the open file is embedded before the alphabetically-earlier
+#    untouched files
+```
+
 ---
 
 ## Files Created/Modified
@@ -191,14 +310,31 @@ src/tools/
   ├── git.ts
   ├── debug.ts
   └── index.ts
+
+src/security/
+  ├── ignoreService.ts
+  ├── secretScanner.ts
+  └── workspaceGuard.ts
+
+src/api/
+  └── circuitBreaker.ts
 ```
 
 ### Modified Files
 ```
-src/extension.ts                 # Initialize indexer, tools, ranker; register search_workspace/debug tools
-src/api/venice.ts               # Add tool-calling support
-package.json                    # Dependencies: better-sqlite3, transformers, ignore, shell-quote;
-                                 # engines.vscode / @types/vscode bumped to ^1.93.0
+src/extension.ts                 # Wire indexer/tools/ranker; construct one shared VeniceClient +
+                                  # IgnoreService; register new commands
+src/api/venice.ts                # Tool-calling support; circuit breaker + backoff; workspace-enabled
+                                  # gate; secret redaction on outgoing messages
+src/chat/chatProvider.ts         # Takes a shared VeniceClient; circuit-open banner UI
+src/completion/inlineProvider.ts # Takes a shared VeniceClient; .veniceignore + workspace-enabled checks
+src/context/workspaceIndexer.ts  # Shared IgnoreService; hot-set prioritization; size cap; event-loop yield
+src/context/embeddingStore.ts    # getDatabaseSizeBytes()
+src/context/types.ts             # IndexStatus: sizeBytes, sizeCapped
+package.json                     # Dependencies: better-sqlite3, transformers, ignore, shell-quote;
+                                  # engines.vscode / @types/vscode bumped to ^1.93.0; new commands
+                                  # (rebuildIndex, showIndexStatus, toggleWorkspaceEnabled) and
+                                  # settings (venice.enabled, venice.maxIndexSizeMB)
 ```
 
 ---
@@ -211,17 +347,25 @@ package.json                    # Dependencies: better-sqlite3, transformers, ig
 4. **Modular tools**: each tool is independently testable and replaceable
 5. **LSP-aware**: leverages existing language servers for precise code understanding
 6. **Workspace-scoped**: indexer respects workspace boundaries and ignore rules
+7. **Fail closed on sensitive content**: `.veniceignore` exclusion and secret redaction sit in
+   front of every network call, not bolted onto individual features
+8. **One client, one circuit**: chat and completions share a single `VeniceClient` so backend
+   health (and the workspace-enabled toggle) is consistent across the whole extension
 
 ---
 
 ## Phase 2 Readiness
 
 The extension now has all infrastructure for Phase 2 (Agent Loop):
-- `VeniceClient` supports tool-calling
+- `VeniceClient` supports tool-calling, and already gates/redacts/circuit-breaks every call, so
+  Phase 2's context-assembly step inherits that protection for free
 - `ToolRegistry.getSchemas()` provides OpenAI-compatible tool definitions
 - `ToolRegistry.execute(toolCall)` handles approval + execution
 - `RelevanceRanker` provides multi-signal ranking for context assembly
-- `getIndexer()`, `getToolRegistry()`, `getRelevanceRanker()` exported from extension.ts
+- `IgnoreService` is available for Phase 2's context assembly to skip excluded chunks before
+  they're ever added to a prompt (today it's only wired into inline completions)
+- `getIndexer()`, `getToolRegistry()`, `getRelevanceRanker()`, `getIgnoreService()` exported from
+  extension.ts
 
 Phase 2 implementation will create `AgentSession` class that:
 1. Calls `indexer.query(userMessage)` → rank → assemble context
@@ -234,7 +378,10 @@ Phase 2 implementation will create `AgentSession` class that:
 ## Rollback
 
 All changes are reversible:
-- Delete `src/context/` and `src/tools/` directories
+- Delete `src/context/`, `src/tools/`, `src/security/`, and `src/api/circuitBreaker.ts`
 - Remove dependencies: `npm uninstall better-sqlite3 @xenova/transformers ignore shell-quote @types/better-sqlite3`
-- Revert `src/extension.ts` and `src/api/venice.ts` to original
+- Revert `src/extension.ts`, `src/api/venice.ts`, `src/chat/chatProvider.ts`, and
+  `src/completion/inlineProvider.ts` to original
+- Remove `venice.enabled` / `venice.maxIndexSizeMB` settings and the `venice.showIndexStatus` /
+  `venice.toggleWorkspaceEnabled` commands from `package.json`
 - No database files are committed; `globalStorageUri` is user-local only

@@ -4,20 +4,26 @@ import { ChatViewProvider } from './chat/chatProvider';
 import { InlineCompletionProvider } from './completion/inlineProvider';
 import { WorkspaceIndexer, RelevanceRanker } from './context';
 import { ToolRegistry, PermissionManager, FilesystemTools, TerminalTools, GitTools, DebugTools } from './tools';
+import { IgnoreService } from './security/ignoreService';
+import { toggleVeniceEnabled, isVeniceEnabled } from './security/workspaceGuard';
 
-let completionsEnabled = true;
 let indexer: WorkspaceIndexer;
 let toolRegistry: ToolRegistry;
 let ranker: RelevanceRanker;
+let ignoreService: IgnoreService;
 
 export function activate(context: vscode.ExtensionContext) {
     console.log('Venice AI extension activated');
 
+    // Single shared client so the network circuit breaker actually protects the whole
+    // extension (chat + completions), not just whichever feature happened to construct its own.
     const client = new VeniceClient(context);
 
-    // Initialize indexer
     const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
-    indexer = new WorkspaceIndexer(context);
+    ignoreService = new IgnoreService(workspaceRoot);
+
+    // Initialize indexer
+    indexer = new WorkspaceIndexer(context, ignoreService);
     const watcherDisposable = indexer.registerFileWatcher();
     context.subscriptions.push(indexer);
     context.subscriptions.push(watcherDisposable);
@@ -43,7 +49,7 @@ export function activate(context: vscode.ExtensionContext) {
     // Initialize relevance ranker
     ranker = new RelevanceRanker(workspaceRoot);
 
-    const chatProvider = new ChatViewProvider(context.extensionUri, context);
+    const chatProvider = new ChatViewProvider(context.extensionUri, client);
     context.subscriptions.push(
         vscode.window.registerWebviewViewProvider(
             ChatViewProvider.viewType,
@@ -51,7 +57,7 @@ export function activate(context: vscode.ExtensionContext) {
         )
     );
 
-    const inlineProvider = new InlineCompletionProvider(context);
+    const inlineProvider = new InlineCompletionProvider(client, ignoreService);
     context.subscriptions.push(
         vscode.languages.registerInlineCompletionItemProvider(
             { pattern: '**' },
@@ -93,6 +99,21 @@ export function activate(context: vscode.ExtensionContext) {
     );
 
     context.subscriptions.push(
+        vscode.commands.registerCommand('venice.toggleWorkspaceEnabled', async () => {
+            try {
+                const enabled = await toggleVeniceEnabled();
+                vscode.window.showInformationMessage(
+                    `Venice AI is now ${enabled ? 'enabled' : 'disabled'} for this workspace`
+                );
+            } catch (error) {
+                vscode.window.showErrorMessage(
+                    `Could not update workspace setting: ${error instanceof Error ? error.message : 'Unknown error'}`
+                );
+            }
+        })
+    );
+
+    context.subscriptions.push(
         vscode.commands.registerCommand('venice.clearChat', () => {
             chatProvider.clearHistory();
             vscode.window.showInformationMessage('Venice chat history cleared');
@@ -104,6 +125,26 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.commands.registerCommand('venice.rebuildIndex', async () => {
             await indexer.buildInitialIndex();
             vscode.window.showInformationMessage('Venice index rebuilt');
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('venice.showIndexStatus', () => {
+            const status = indexer.getStatus();
+            const sizeMB = ((status.sizeBytes ?? 0) / (1024 * 1024)).toFixed(1);
+            const lines = [
+                `State: ${status.state}`,
+                `Files indexed: ${status.filesIndexed} / ${status.totalFiles} (${status.progress}%)`,
+                `Index size on disk: ${sizeMB} MB`,
+            ];
+            if (status.sizeCapped) {
+                lines.push('Background sweep stopped early: index size cap reached (venice.maxIndexSizeMB).');
+            }
+            if (status.error) {
+                lines.push(`Error: ${status.error}`);
+            }
+            lines.push(`Venice enabled for this workspace: ${isVeniceEnabled() ? 'yes' : 'no'}`);
+            vscode.window.showInformationMessage(lines.join('\n'), { modal: true });
         })
     );
 
@@ -134,6 +175,10 @@ export function getToolRegistry(): ToolRegistry {
 
 export function getRelevanceRanker(): RelevanceRanker {
     return ranker;
+}
+
+export function getIgnoreService(): IgnoreService {
+    return ignoreService;
 }
 
 export function deactivate() {

@@ -33,4 +33,6 @@ export interface IndexStatus {
   progress: number; // 0-100
   error?: string;
   lastUpdated?: number;
+  sizeBytes?: number; // on-disk size of the embedding database
+  sizeCapped?: boolean; // true if the background sweep stopped early due to the size cap
 }
